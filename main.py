@@ -1,360 +1,271 @@
 # =====================================================
-# Altcoin Pump & Dump Radar (3m Version)
+# 🚀 V11 WebSocket低延迟交易系统（参数可调版）
 # =====================================================
 
 import os
-import csv
 import time
 from datetime import datetime, timedelta, timezone
-import pandas as pd
-from binance.client import Client
-from binance import ThreadedWebsocketManager
 import threading
 import requests
+from collections import deque
+from binance.client import Client
+from binance import ThreadedWebsocketManager
 
 # =====================================================
-# 北京时间
+# 🧠【参数配置区】——你以后主要调这里
 # =====================================================
 
-BEIJING_TZ = timezone(timedelta(hours=8))
+# ===== Micro（秒级信号） =====
+MICRO_WINDOW_SECONDS = 15      # 统计多少秒的成交数据（建议 10~30）
+MICRO_PCT_THRESHOLD = 0.3     # 触发涨跌幅（%）👉 核心参数
+MICRO_MIN_TRADES = 5          # 最少成交笔数（过滤噪音）
 
-def bj_time():
-    return datetime.now(BEIJING_TZ)
+# ===== K线确认 =====
+KLINE_1M_THRESHOLD = 1.0      # 1m涨幅确认
+KLINE_3M_THRESHOLD = 3.0      # 3m趋势确认
+
+# ===== 止盈止损 =====
+STOP_LOSS_PCT = -1.0          # 止损（%）
+TAKE_PROFIT_PCT = 2.0         # 止盈（%）
+
+# ===== 推送控制 =====
+MIN_SCORE_TO_ALERT = 2        # 最低推送强度（避免刷屏）
 
 # =====================================================
-# 配置
+# API配置
 # =====================================================
 
-API_KEY = os.getenv("API_KEY", "")
-API_SECRET = os.getenv("API_SECRET", "")
-SERVER_CHAN_KEY = os.getenv("SERVER_CHAN_KEY", "sctp14659thuntd89pzhhlsmbwynooxu")
-
-VOLUME_THRESHOLD_24H = 15000000
-SIGNAL_CSV = "signals_3m.csv"
-SCAN_INTERVAL = 10
-
-# =====================================================
-# Binance Client
-# =====================================================
+API_KEY = os.getenv("API_KEY")
+API_SECRET = os.getenv("API_SECRET")
+SERVER_KEY = os.getenv("sctp14659thuntd89pzhhlsmbwynooxu")
 
 client = Client(API_KEY, API_SECRET)
 
+BEIJING_TZ = timezone(timedelta(hours=8))
+
+def now():
+    return datetime.now(BEIJING_TZ)
+
 # =====================================================
-# Server酱
+# 📩 推送模块（Server酱）
 # =====================================================
 
-def send_server_chan(title, content):
-
-    url = f"https://sctapi.ftqq.com/{SERVER_CHAN_KEY}.send"
-
-    data = {
-        "title": title,
-        "desp": content
-    }
-
+def push(msg):
     try:
-        requests.post(url, data=data, timeout=5)
-    except Exception as e:
-        print("推送失败:", e)
-
-# =====================================================
-# CSV
-# =====================================================
-
-def save_csv(data):
-
-    file_exists = os.path.isfile(SIGNAL_CSV)
-
-    with open(SIGNAL_CSV,"a",newline='',encoding="utf-8-sig") as f:
-
-        writer = csv.writer(f)
-
-        if not file_exists:
-
-            writer.writerow([
-                "time",
-                "symbol",
-                "direction",
-                "score",
-                "pct",
-                "volume_ratio",
-                "velocity",
-                "momentum",
-                "consec_score"
-            ])
-
-        writer.writerow(data)
-
-# =====================================================
-# 获取交易对
-# =====================================================
-
-def get_filtered_symbols():
-
-    tickers = client.futures_ticker()
-
-    symbols = [
-        t["symbol"]
-        for t in tickers
-        if float(t["quoteVolume"]) >= VOLUME_THRESHOLD_24H
-        and t["symbol"].endswith("USDT")
-    ]
-
-    return symbols
-
-# =====================================================
-# 连续爆发缓存
-# =====================================================
-
-consec_cache = {}
-
-# =====================================================
-# 评分系统
-# =====================================================
-
-def score_radar(df, symbol):
-
-    last = df.iloc[-1]
-
-    pct = (last["close"] - last["open"]) / last["open"] * 100
-
-    direction = "UP" if pct > 0 else "DOWN"
-
-    pct_abs = abs(pct)
-
-    # ===== 3分钟K线必须 >=3% 才参与评分 =====
-    if pct_abs < 3:
-        return None
-
-    window = min(20, len(df))
-
-    ma_vol = df["volume"].rolling(window).mean().iloc[-1]
-
-    if pd.isna(ma_vol) or ma_vol == 0:
-        return None
-
-    vol_ratio = last["volume"] / ma_vol
-
-    if vol_ratio < 1.5:
-        return None
-
-    score = 0
-
-    # ===== 单K幅度 =====
-    if pct_abs >= 6:
-        score += 4
-    elif pct_abs >= 5:
-        score += 3
-    elif pct_abs >= 4:
-        score += 2
-    else:
-        score += 1
-
-    # ===== 成交量 =====
-    if vol_ratio >= 3:
-        score += 3
-    elif vol_ratio >= 2:
-        score += 2
-    else:
-        score += 1
-
-    # ===== 速度 =====
-    if len(df) >= 4:
-
-        velocity = (
-            df["close"].iloc[-1] -
-            df["open"].iloc[-4]
-        ) / df["open"].iloc[-4] * 100
-
-    else:
-
-        velocity = 0
-
-    velocity_abs = abs(velocity)
-
-    if velocity_abs >= 8:
-        score += 2
-    elif velocity_abs >= 5:
-        score += 1
-
-    # ===== 动量 =====
-    ema20 = df["close"].ewm(span=20, min_periods=1).mean().iloc[-1]
-
-    if direction == "UP":
-        momentum = last["close"] > ema20
-    else:
-        momentum = last["close"] < ema20
-
-    if momentum:
-        score += 1
-
-    # ===== 连续爆发 =====
-    pct_list = consec_cache.get(symbol, [])
-
-    pct_list.append(pct)
-
-    if len(pct_list) > 3:
-        pct_list.pop(0)
-
-    consec_cache[symbol] = pct_list
-
-    consec_score = 0
-
-    if len(pct_list) >= 2:
-
-        if direction == "UP":
-            count = sum(1 for p in pct_list if p >= 3)
-        else:
-            count = sum(1 for p in pct_list if p <= -3)
-
-        if count >= 2:
-            consec_score = 1
-
-        if count >= 3:
-            consec_score = 2
-
-        if count == 3 and pct_abs >= 6:
-            consec_score = 3
-
-    total_score = score + consec_score
-
-    return total_score,pct,vol_ratio,velocity,momentum,consec_score,direction
-
-# =====================================================
-# 信号等级
-# =====================================================
-
-def signal_level(score):
-
-    if score >= 10:
-        return "🚀绝佳"
-    elif score >= 7:
-        return "🔥优质"
-    else:
-        return "⚡普通"
-
-# =====================================================
-# WebSocket
-# =====================================================
-
-processed = set()
-
-lock = threading.Lock()
-
-def handle_kline(msg):
-
-    try:
-
-        symbol = msg['s']
-        k = msg['k']
-
-        if not k['x']:
-            return
-
-        hist = client.futures_klines(symbol=symbol, interval='3m', limit=30)
-
-        df = pd.DataFrame(hist)
-
-        df = df.iloc[:,0:6]
-
-        df.columns = [
-            'time',
-            'open',
-            'high',
-            'low',
-            'close',
-            'volume'
-        ]
-
-        df[['open','high','low','close','volume']] = df[['open','high','low','close','volume']].astype(float)
-
-        result = score_radar(df, symbol)
-
-        if result is None:
-            return
-
-        score,pct,vol_ratio,velocity,momentum,consec_score,direction = result
-
-        level = signal_level(score)
-
-        icon = "📈涨" if direction == "UP" else "📉跌"
-
-        with lock:
-
-            if symbol in processed:
-                return
-
-            processed.add(symbol)
-
-        msg_send = f"""
-币对: {symbol}
-
-信号: {icon}
-信号等级: {level} ({score}/13)
-
-3m单K涨跌: {pct:.2f}%
-成交量倍率: {vol_ratio:.2f}x
-速度: {velocity:.2f}%
-动量: {"强" if momentum else "弱"}
-连续爆发评分: {consec_score}
-
-时间: {bj_time().strftime('%Y-%m-%d %H:%M:%S')} GMT+8
-"""
-
-        send_server_chan(
-            f"{icon} {symbol} {level}",
-            msg_send
+        requests.post(
+            f"https://sctapi.ftqq.com/{SERVER_KEY}.send",
+            data={"title": "交易信号", "desp": msg},
+            timeout=5
         )
-
-        save_csv([
-            bj_time(),
-            symbol,
-            direction,
-            score,
-            pct,
-            vol_ratio,
-            velocity,
-            momentum,
-            consec_score
-        ])
-
-    except Exception as e:
-
-        print("K线处理异常:", e)
+    except:
+        pass
 
 # =====================================================
-# 心跳
+# 📦 数据缓存（核心：全部本地维护）
 # =====================================================
 
-def heartbeat():
+trade_cache = {}   # 秒级成交缓存
+kline_1m = {}      # 1分钟K线
+kline_3m = {}      # 3分钟K线
 
-    while True:
-
-        try:
-
-            symbols = get_filtered_symbols()
-
-            print(
-                f"[{bj_time().strftime('%H:%M:%S')}] "
-                f"扫描:{len(symbols)} "
-                f"推送:{len(processed)}"
-            )
-
-        except Exception as e:
-
-            print("心跳异常:", e)
-
-        time.sleep(SCAN_INTERVAL)
+positions = {}     # 当前持仓状态
 
 # =====================================================
-# 主程序
+# 🚀 Micro检测（秒级核心）
+# =====================================================
+
+def detect_micro(symbol):
+
+    trades = trade_cache.get(symbol)
+
+    # ===== 数据不足直接跳过 =====
+    if not trades or len(trades) < MICRO_MIN_TRADES:
+        return None
+
+    prices = [t[0] for t in trades]
+    qtys = [t[1] for t in trades]
+
+    # ===== 计算涨跌幅 =====
+    pct = (prices[-1] - prices[0]) / prices[0] * 100
+
+    volume = sum(qtys)
+
+    # ===== 核心过滤条件（可调）=====
+    if abs(pct) < MICRO_PCT_THRESHOLD:
+        return None
+
+    return pct, volume
+
+# =====================================================
+# 📊 K线评分（趋势确认）
+# =====================================================
+
+def kline_score(data, threshold):
+
+    if not data or len(data) < 2:
+        return None
+
+    o, c, v = data[-1]
+
+    pct = (c - o) / o * 100
+
+    # ===== 是否满足趋势强度 =====
+    if abs(pct) < threshold:
+        return None
+
+    return pct
+
+# =====================================================
+# 🧠 主交易逻辑（核心引擎）
+# =====================================================
+
+def process_signal(symbol):
+
+    micro = detect_micro(symbol)
+
+    k1 = kline_score(kline_1m.get(symbol), KLINE_1M_THRESHOLD)
+    k3 = kline_score(kline_3m.get(symbol), KLINE_3M_THRESHOLD)
+
+    # ===== 没有micro直接退出（先手必须）=====
+    if not micro:
+        return
+
+    pct_micro, vol = micro
+
+    direction = "LONG" if pct_micro > 0 else "SHORT"
+
+    pos = positions.get(symbol)
+
+    price = trade_cache[symbol][-1][0]
+
+    # =====================================================
+    # 🟢 开仓（第一阶段）
+    # =====================================================
+    if not pos:
+
+        positions[symbol] = {
+            "stage": 1,
+            "entry": price,
+            "direction": direction
+        }
+
+        push(f"{symbol} 🟡Micro开仓\n涨幅:{pct_micro:.2f}%")
+
+        return
+
+    # =====================================================
+    # 🟠 加仓（1m确认）
+    # =====================================================
+    if pos["stage"] == 1 and k1:
+
+        pos["stage"] = 2
+
+        push(f"{symbol} 🟠加仓（1m确认）\n1m涨幅:{k1:.2f}%")
+
+    # =====================================================
+    # 🔴 满仓（3m趋势）
+    # =====================================================
+    elif pos["stage"] == 2 and k3:
+
+        pos["stage"] = 3
+
+        push(f"{symbol} 🔴满仓（3m趋势）\n3m涨幅:{k3:.2f}%")
+
+    # =====================================================
+    # 💰 止盈止损
+    # =====================================================
+
+    pnl = (price - pos["entry"]) / pos["entry"] * 100
+
+    if direction == "SHORT":
+        pnl = -pnl
+
+    # ===== 止损 =====
+    if pnl < STOP_LOSS_PCT:
+
+        push(f"{symbol} ❌止损 {pnl:.2f}%")
+        positions.pop(symbol)
+        return
+
+    # ===== 止盈 =====
+    if pnl > TAKE_PROFIT_PCT:
+
+        push(f"{symbol} ✅止盈 {pnl:.2f}%")
+        positions.pop(symbol)
+        return
+
+# =====================================================
+# 📡 WebSocket：成交流（最重要）
+# =====================================================
+
+def handle_trade(msg):
+
+    symbol = msg['s']
+    price = float(msg['p'])
+    qty = float(msg['q'])
+    t = time.time()
+
+    if symbol not in trade_cache:
+        trade_cache[symbol] = deque()
+
+    trade_cache[symbol].append((price, qty, t))
+
+    # ===== 滑动窗口（秒级）=====
+    while trade_cache[symbol] and t - trade_cache[symbol][0][2] > MICRO_WINDOW_SECONDS:
+        trade_cache[symbol].popleft()
+
+    process_signal(symbol)
+
+# =====================================================
+# 📊 K线（1m）
+# =====================================================
+
+def handle_kline_1m(msg):
+
+    k = msg['k']
+    symbol = msg['s']
+
+    if not k['x']:
+        return
+
+    o = float(k['o'])
+    c = float(k['c'])
+    v = float(k['v'])
+
+    kline_1m.setdefault(symbol, []).append((o,c,v))
+
+# =====================================================
+# 📊 K线（3m）
+# =====================================================
+
+def handle_kline_3m(msg):
+
+    k = msg['k']
+    symbol = msg['s']
+
+    if not k['x']:
+        return
+
+    o = float(k['o'])
+    c = float(k['c'])
+    v = float(k['v'])
+
+    kline_3m.setdefault(symbol, []).append((o,c,v))
+
+# =====================================================
+# 🚀 主程序
 # =====================================================
 
 def main():
 
-    symbols = get_filtered_symbols()
+    symbols = [
+        s["symbol"]
+        for s in client.futures_ticker()
+        if s["symbol"].endswith("USDT")
+        and float(s["quoteVolume"]) > 6000000
+    ]
 
-    print("启动交易对数量:", len(symbols))
+    print("交易对数量:", len(symbols))
 
     twm = ThreadedWebsocketManager(
         api_key=API_KEY,
@@ -364,20 +275,13 @@ def main():
     twm.start()
 
     for s in symbols:
-
-        twm.start_kline_socket(
-            callback=handle_kline,
-            symbol=s,
-            interval='3m'
-        )
-
-    threading.Thread(
-        target=heartbeat,
-        daemon=True
-    ).start()
+        twm.start_aggtrade_socket(callback=handle_trade, symbol=s)
+        twm.start_kline_socket(callback=handle_kline_1m, symbol=s, interval="1m")
+        twm.start_kline_socket(callback=handle_kline_3m, symbol=s, interval="3m")
 
     while True:
-        time.sleep(1)
+        print(f"[{now().strftime('%H:%M:%S')}] 运行中 | 持仓:{len(positions)}")
+        time.sleep(10)
 
 # =====================================================
 
