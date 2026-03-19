@@ -1,289 +1,305 @@
 # =====================================================
-# 🚀 V11 WebSocket低延迟交易系统（参数可调版）
+# 秒级爆发雷达 PRO（Tick + 结构 + 趋势 + 冷却）
 # =====================================================
 
-import os
 import time
-from datetime import datetime, timedelta, timezone
-import threading
+from datetime import datetime, timedelta
+from collections import deque, defaultdict
 import requests
-from collections import deque
-from binance.client import Client
 from binance import ThreadedWebsocketManager
+from binance.client import Client
+import pandas as pd
+import os
+import threading
 
 # =====================================================
-# 🧠【参数配置区】——你以后主要调这里
+# ✅ 参数区（⭐核心调这里）
 # =====================================================
 
-# ===== Micro（秒级信号） =====
-MICRO_WINDOW_SECONDS = 15      # 统计多少秒的成交数据（建议 10~30）
-MICRO_PCT_THRESHOLD = 0.3     # 触发涨跌幅（%）👉 核心参数
-MICRO_MIN_TRADES = 5          # 最少成交笔数（过滤噪音）
+MAX_SYMBOLS = 120
+MIN_24H_USDT = 8_000_000
 
-# ===== K线确认 =====
-KLINE_1M_THRESHOLD = 1.0      # 1m涨幅确认
-KLINE_3M_THRESHOLD = 3.0      # 3m趋势确认
+WINDOW = 15
+THRESH = 0.2
+VOL_MULT = 1.2
 
-# ===== 止盈止损 =====
-STOP_LOSS_PCT = -1.0          # 止损（%）
-TAKE_PROFIT_PCT = 2.0         # 止盈（%）
+PHASE_ALERT = 2
+PHASE_TRIGGER = 3
 
-# ===== 推送控制 =====
-MIN_SCORE_TO_ALERT = 2        # 最低推送强度（避免刷屏）
+COOLDOWN = 300
+
+PUSH_KEY = "sctp14659thuntd89pzhhlsmbwynooxu"
 
 # =====================================================
-# API配置
+# 初始化
 # =====================================================
 
-API_KEY = os.getenv("API_KEY")
-API_SECRET = os.getenv("API_SECRET")
-SERVER_KEY = os.getenv("sctp14659thuntd89pzhhlsmbwynooxu")
+client = Client()
 
-client = Client(API_KEY, API_SECRET)
+tick_cache = defaultdict(lambda: deque())
+vol_cache = defaultdict(lambda: deque())
 
-BEIJING_TZ = timezone(timedelta(hours=8))
+phase_map = {}
+cooldown_map = {}
+
+lock = threading.Lock()
+
+# =====================================================
+# 工具
+# =====================================================
 
 def now():
-    return datetime.now(BEIJING_TZ)
+    return (datetime.utcnow() + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
 
-# =====================================================
-# 📩 推送模块（Server酱）
-# =====================================================
-
-def push(msg):
+def push(title, content):
     try:
-        requests.post(
-            f"https://sctapi.ftqq.com/{SERVER_KEY}.send",
-            data={"title": "交易信号", "desp": msg},
-            timeout=5
-        )
+        requests.post(f"https://sctapi.ftqq.com/{PUSH_KEY}.send",
+                      data={"title": title, "desp": content}, timeout=5)
     except:
         pass
 
-# =====================================================
-# 📦 数据缓存（核心：全部本地维护）
-# =====================================================
-
-trade_cache = {}   # 秒级成交缓存
-kline_1m = {}      # 1分钟K线
-kline_3m = {}      # 3分钟K线
-
-positions = {}     # 当前持仓状态
+def save_csv(row):
+    df = pd.DataFrame([row])
+    df.to_csv("signals_15sec.csv", mode='a',
+              header=not os.path.exists("signals.csv"),
+              index=False, encoding='utf-8-sig')
 
 # =====================================================
-# 🚀 Micro检测（秒级核心）
+# ✅ 1分钟结构分析（压缩 + 吸筹 + 速度）
 # =====================================================
 
-def detect_micro(symbol):
+def structure_analysis(symbol):
+    try:
+        kl = client.futures_klines(symbol=symbol, interval='1m', limit=20)
 
-    trades = trade_cache.get(symbol)
+        df = pd.DataFrame(kl, columns=[
+            't','o','h','l','c','v','ct','q','n','tb','tq','ig'
+        ])
 
-    # ===== 数据不足直接跳过 =====
-    if not trades or len(trades) < MICRO_MIN_TRADES:
-        return None
+        df[['o','h','l','c','v']] = df[['o','h','l','c','v']].astype(float)
 
-    prices = [t[0] for t in trades]
-    qtys = [t[1] for t in trades]
+        # ===== 压缩 =====
+        ranges = (df['h'] - df['l'])
+        compress = ranges.tail(5).mean() < ranges.mean() * 0.7
 
-    # ===== 计算涨跌幅 =====
-    pct = (prices[-1] - prices[0]) / prices[0] * 100
+        # ===== 吸筹 =====
+        vol = df['v']
+        accumulation = vol.tail(3).mean() > vol.mean()
 
-    volume = sum(qtys)
+        # ===== 速度 =====
+        velocity = (df['c'].iloc[-1] - df['o'].iloc[-4]) / df['o'].iloc[-4] * 100
 
-    # ===== 核心过滤条件（可调）=====
-    if abs(pct) < MICRO_PCT_THRESHOLD:
-        return None
+        # ===== 打标签 =====
+        score = 0
 
-    return pct, volume
+        if compress:
+            score += 2
+            compress_label = "强"
+        else:
+            compress_label = "弱"
 
-# =====================================================
-# 📊 K线评分（趋势确认）
-# =====================================================
+        if accumulation:
+            score += 2
+            acc_label = "强"
+        else:
+            acc_label = "弱"
 
-def kline_score(data, threshold):
+        if velocity >= 3:
+            score += 2
+            vel_label = "强"
+        elif velocity >= 1.5:
+            score += 1
+            vel_label = "中"
+        else:
+            vel_label = "弱"
 
-    if not data or len(data) < 2:
-        return None
+        return score, compress_label, acc_label, vel_label, velocity
 
-    o, c, v = data[-1]
-
-    pct = (c - o) / o * 100
-
-    # ===== 是否满足趋势强度 =====
-    if abs(pct) < threshold:
-        return None
-
-    return pct
-
-# =====================================================
-# 🧠 主交易逻辑（核心引擎）
-# =====================================================
-
-def process_signal(symbol):
-
-    micro = detect_micro(symbol)
-
-    k1 = kline_score(kline_1m.get(symbol), KLINE_1M_THRESHOLD)
-    k3 = kline_score(kline_3m.get(symbol), KLINE_3M_THRESHOLD)
-
-    # ===== 没有micro直接退出（先手必须）=====
-    if not micro:
-        return
-
-    pct_micro, vol = micro
-
-    direction = "LONG" if pct_micro > 0 else "SHORT"
-
-    pos = positions.get(symbol)
-
-    price = trade_cache[symbol][-1][0]
-
-    # =====================================================
-    # 🟢 开仓（第一阶段）
-    # =====================================================
-    if not pos:
-
-        positions[symbol] = {
-            "stage": 1,
-            "entry": price,
-            "direction": direction
-        }
-
-        push(f"{symbol} 🟡Micro开仓\n涨幅:{pct_micro:.2f}%")
-
-        return
-
-    # =====================================================
-    # 🟠 加仓（1m确认）
-    # =====================================================
-    if pos["stage"] == 1 and k1:
-
-        pos["stage"] = 2
-
-        push(f"{symbol} 🟠加仓（1m确认）\n1m涨幅:{k1:.2f}%")
-
-    # =====================================================
-    # 🔴 满仓（3m趋势）
-    # =====================================================
-    elif pos["stage"] == 2 and k3:
-
-        pos["stage"] = 3
-
-        push(f"{symbol} 🔴满仓（3m趋势）\n3m涨幅:{k3:.2f}%")
-
-    # =====================================================
-    # 💰 止盈止损
-    # =====================================================
-
-    pnl = (price - pos["entry"]) / pos["entry"] * 100
-
-    if direction == "SHORT":
-        pnl = -pnl
-
-    # ===== 止损 =====
-    if pnl < STOP_LOSS_PCT:
-
-        push(f"{symbol} ❌止损 {pnl:.2f}%")
-        positions.pop(symbol)
-        return
-
-    # ===== 止盈 =====
-    if pnl > TAKE_PROFIT_PCT:
-
-        push(f"{symbol} ✅止盈 {pnl:.2f}%")
-        positions.pop(symbol)
-        return
+    except:
+        return 0, "弱", "弱", "弱", 0
 
 # =====================================================
-# 📡 WebSocket：成交流（最重要）
+# 趋势判断
+# =====================================================
+
+def get_trend(symbol, interval):
+    try:
+        kl = client.futures_klines(symbol=symbol, interval=interval, limit=200)
+        df = pd.DataFrame(kl, columns=[
+            't','o','h','l','c','v','ct','q','n','tb','tq','ig'
+        ])
+        df['close'] = df['c'].astype(float)
+        df['ema144'] = df['close'].ewm(span=144).mean()
+
+        above = (df['close'] > df['ema144']).sum()
+        below = (df['close'] < df['ema144']).sum()
+
+        if above / len(df) > 0.6:
+            return "看涨"
+        elif below / len(df) > 0.6:
+            return "看跌"
+        else:
+            return "震荡"
+    except:
+        return "未知"
+
+def multi_trend(symbol):
+    t1 = get_trend(symbol, '1m')
+    t5 = get_trend(symbol, '5m')
+    t15 = get_trend(symbol, '15m')
+
+    if t1 == t5 == t15:
+        res = "共振"
+    else:
+        res = "无共振"
+
+    return t1, t5, t15, res
+
+# =====================================================
+# 核心Tick逻辑
 # =====================================================
 
 def handle_trade(msg):
+    try:
+        if 'data' not in msg:
+            return
 
-    symbol = msg['s']
-    price = float(msg['p'])
-    qty = float(msg['q'])
-    t = time.time()
+        data = msg['data']
+        if data['e'] != 'aggTrade':
+            return
 
-    if symbol not in trade_cache:
-        trade_cache[symbol] = deque()
+        symbol = data['s']
+        price = float(data['p'])
+        qty = float(data['q'])
+        ts = time.time()
 
-    trade_cache[symbol].append((price, qty, t))
+        tick_cache[symbol].append((ts, price))
+        vol_cache[symbol].append((ts, price * qty))
 
-    # ===== 滑动窗口（秒级）=====
-    while trade_cache[symbol] and t - trade_cache[symbol][0][2] > MICRO_WINDOW_SECONDS:
-        trade_cache[symbol].popleft()
+        while tick_cache[symbol] and ts - tick_cache[symbol][0][0] > WINDOW:
+            tick_cache[symbol].popleft()
 
-    process_signal(symbol)
+        while vol_cache[symbol] and ts - vol_cache[symbol][0][0] > WINDOW:
+            vol_cache[symbol].popleft()
+
+        if len(tick_cache[symbol]) < 5:
+            return
+
+        start_price = tick_cache[symbol][0][1]
+        pct = (price - start_price) / start_price * 100
+
+        vol = sum(v for _, v in vol_cache[symbol])
+        vol_ratio = vol / (len(vol_cache[symbol]) + 1e-6)
+
+        with lock:
+            phase = phase_map.get(symbol, 0)
+
+            if abs(pct) >= THRESH and vol_ratio >= VOL_MULT:
+                phase += 1
+            else:
+                phase = max(0, phase - 1)
+
+            phase_map[symbol] = phase
+
+        current_time = now()
+
+        # =============================
+        # Phase2：埋伏
+        # =============================
+        if phase == PHASE_ALERT:
+
+            key = (symbol, "alert")
+            if time.time() - cooldown_map.get(key, 0) < COOLDOWN:
+                return
+
+            cooldown_map[key] = time.time()
+
+            push(f"{symbol} ⚠️埋伏",
+                 f"{symbol}\n涨幅:{pct:.2f}%\n量:{vol_ratio:.2f}\n时间:{current_time}")
+
+        # =============================
+        # Phase4：开仓（结构过滤）
+        # =============================
+        if phase >= PHASE_TRIGGER:
+
+            key = (symbol, "entry")
+            if time.time() - cooldown_map.get(key, 0) < COOLDOWN:
+                return
+
+            # ⭐结构判断（核心）
+            s_score, comp, acc, vel_label, velocity = structure_analysis(symbol)
+
+            if s_score < 3:
+                return
+
+            cooldown_map[key] = time.time()
+
+            direction = "🚀看涨" if pct > 0 else "🔻看跌"
+
+            t1, t5, t15, res = multi_trend(symbol)
+
+            msg_text = f"""
+币对: {symbol}
+信号: {direction}
+
+【Tick】
+15秒涨幅: {pct:.2f}%
+成交量: {vol_ratio:.2f}
+
+【结构】
+压缩: {comp}
+吸筹: {acc}
+速度: {vel_label} ({velocity:.2f}%)
+
+【趋势】
+1m:{t1} 5m:{t5} 15m:{t15}
+共振:{res}
+
+时间: {current_time}
+"""
+
+            push(f"{symbol} 🚀开仓信号", msg_text)
+
+            save_csv([
+                current_time, symbol, direction,
+                pct, vol_ratio,
+                comp, acc, vel_label,
+                t1, t5, t15, res
+            ])
+
+            phase_map[symbol] = 0
+
+    except Exception as e:
+        print("错误:", e)
 
 # =====================================================
-# 📊 K线（1m）
+# 获取交易对
 # =====================================================
 
-def handle_kline_1m(msg):
-
-    k = msg['k']
-    symbol = msg['s']
-
-    if not k['x']:
-        return
-
-    o = float(k['o'])
-    c = float(k['c'])
-    v = float(k['v'])
-
-    kline_1m.setdefault(symbol, []).append((o,c,v))
+def get_symbols():
+    tickers = client.futures_ticker()
+    symbols = [t['symbol'] for t in tickers
+               if float(t['quoteVolume']) > MIN_24H_USDT]
+    return symbols[:MAX_SYMBOLS]
 
 # =====================================================
-# 📊 K线（3m）
+# 启动
 # =====================================================
 
-def handle_kline_3m(msg):
+def start():
+    symbols = get_symbols()
 
-    k = msg['k']
-    symbol = msg['s']
+    streams = [f"{s.lower()}@aggTrade" for s in symbols]
 
-    if not k['x']:
-        return
-
-    o = float(k['o'])
-    c = float(k['c'])
-    v = float(k['v'])
-
-    kline_3m.setdefault(symbol, []).append((o,c,v))
-
-# =====================================================
-# 🚀 主程序
-# =====================================================
-
-def main():
-
-    symbols = [
-        s["symbol"]
-        for s in client.futures_ticker()
-        if s["symbol"].endswith("USDT")
-        and float(s["quoteVolume"]) > 6000000
-    ]
-
-    print("交易对数量:", len(symbols))
-
-    twm = ThreadedWebsocketManager(
-        api_key=API_KEY,
-        api_secret=API_SECRET
-    )
-
+    twm = ThreadedWebsocketManager()
     twm.start()
 
-    for s in symbols:
-        twm.start_aggtrade_socket(callback=handle_trade, symbol=s)
-        twm.start_kline_socket(callback=handle_kline_1m, symbol=s, interval="1m")
-        twm.start_kline_socket(callback=handle_kline_3m, symbol=s, interval="3m")
+    twm.start_multiplex_socket(callback=handle_trade, streams=streams)
 
     while True:
-        print(f"[{now().strftime('%H:%M:%S')}] 运行中 | 持仓:{len(positions)}")
+        print(f"[{now()}] 运行中 | 监控:{len(symbols)}")
         time.sleep(10)
 
-# =====================================================
-
 if __name__ == "__main__":
-    main()
+    print("🚀 PRO版本启动（结构+趋势）")
+    start()
