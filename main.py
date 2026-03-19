@@ -125,13 +125,11 @@ def get_ema_trend(symbol, interval):
     except:
         return "未知"
 
-# =====================================================
-# 🔧修改：评分函数加入预测
-# =====================================================
 def calc_score(df, symbol):
     try:
         last = df.iloc[-1]
         pct = (last['c'] - last['o']) / last['o'] * 100
+
         ma20_vol = df['v'].rolling(20).mean().iloc[-1]
         vol_ratio = last['v'] / (ma20_vol + 1e-6)
 
@@ -139,48 +137,48 @@ def calc_score(df, symbol):
         rng_hist = (df['h'] - df['l']).mean()
         range_ratio = rng_now / (rng_hist + 1e-6)
 
-        trend_count = max((df['c'].diff() > 0).tail(5).sum(),
-                          (df['c'].diff() < 0).tail(5).sum())
+        trend_count = max(
+            (df['c'].diff() > 0).tail(5).sum(),
+            (df['c'].diff() < 0).tail(5).sum()
+        )
 
         speed = (df['c'].iloc[-1] - df['c'].iloc[-4]) / df['c'].iloc[-4] * 100
 
         compression = "强" if (df['h'] - df['l']).tail(5).mean() < 0.5*(df['h'] - df['l']).mean() else "弱"
         accumulation = "强" if df['v'].tail(5).mean() < 0.5*df['v'].mean() else "弱"
 
-        # ===== 资金质量 =====
-        # ⭐修改：资金质量计算（稳定版）
-    try:
-        trades = client.futures_recent_trades(symbol=symbol, limit=200)
-        if trades:
-            trades_df = pd.DataFrame(trades)
-    
-            trades_df['q'] = trades_df['q'].astype(float)
-            trades_df['p'] = trades_df['p'].astype(float)
-    
-            # 成交额
-            trades_df['value'] = trades_df['q'] * trades_df['p']
-    
-            total_value = trades_df['value'].sum()
-            trade_count = len(trades_df)
-    
-            # 平均单笔资金
-            avg_trade = total_value / (trade_count + 1e-6)
-    
-            # ⭐关键：用K线成交额做归一化（更合理）
-            kline_value = df['c'].iloc[-1] * df['v'].iloc[-1]
-    
-            avg_trade_ratio = avg_trade / (kline_value + 1e-6)
-    
-        else:
+        # =====================================================
+        # ⭐资金质量（独立 try，不影响主流程）
+        # =====================================================
+        try:
+            trades = client.futures_recent_trades(symbol=symbol, limit=200)
+
+            if trades:
+                trades_df = pd.DataFrame(trades)
+
+                trades_df['q'] = trades_df['q'].astype(float)
+                trades_df['p'] = trades_df['p'].astype(float)
+                trades_df['value'] = trades_df['q'] * trades_df['p']
+
+                total_value = trades_df['value'].sum()
+                trade_count = len(trades_df)
+
+                avg_trade = total_value / (trade_count + 1e-6)
+
+                kline_value = df['c'].iloc[-1] * df['v'].iloc[-1]
+                avg_trade_ratio = avg_trade / (kline_value + 1e-6)
+            else:
+                avg_trade = 0
+                avg_trade_ratio = 0
+
+        except Exception as e:
+            print("[资金质量异常]", symbol, e)
             avg_trade = 0
             avg_trade_ratio = 0
 
-    except Exception as e:
-        print("[资金质量异常]", e)
-        avg_trade = 0
-        avg_trade_ratio = 0
-
-        # ⭐修改：更真实的资金分类
+        # =====================================================
+        # ⭐资金分类（必须在 try 外）
+        # =====================================================
         if avg_trade > 5000:
             entry_type = "机构"
         elif avg_trade > 1000:
@@ -188,39 +186,70 @@ def calc_score(df, symbol):
         else:
             entry_type = "散户"
 
-        # ===== EMA趋势 =====
+        # =====================================================
+        # EMA趋势
+        # =====================================================
         trend_1m = get_ema_trend(symbol, "1m")
         trend_5m = get_ema_trend(symbol, "5m")
         trend_15m = get_ema_trend(symbol, "15m")
 
         trends = [trend_1m, trend_5m, trend_15m]
-        if trends.count("看涨")>=2:
+
+        if trends.count("看涨") >= 2:
             trend_resonance = "看涨共振"
-        elif trends.count("看跌")>=2:
+        elif trends.count("看跌") >= 2:
             trend_resonance = "看跌共振"
         else:
             trend_resonance = "震荡"
 
-        # ⭐新增：15秒预测
+        # =====================================================
+        # ⭐15秒预测
+        # =====================================================
         predict_dir, predict_pct = predict_15s(symbol)
 
-        # ===== 评分 =====
+        # =====================================================
+        # ⭐评分
+        # =====================================================
         score = 0
-        if vol_ratio >= 3: score +=3
-        elif vol_ratio>=2: score +=2
-        elif vol_ratio>=1.5: score +=1
-        if range_ratio >= 1.5: score+=2
-        elif range_ratio>=1.3: score+=1
-        if trend_count>=4: score+=2
-        if speed>=3: score+=2
-        if compression=="强" and accumulation=="强": score+=1
 
-        return score, pct, vol_ratio, range_ratio, trend_count, speed, compression, accumulation, avg_trade, avg_trade_ratio, entry_type, trend_1m, trend_5m, trend_15m, trend_resonance, predict_dir, predict_pct
+        if vol_ratio >= 3:
+            score += 3
+        elif vol_ratio >= 2:
+            score += 2
+        elif vol_ratio >= 1.5:
+            score += 1
+
+        if range_ratio >= 1.5:
+            score += 2
+        elif range_ratio >= 1.3:
+            score += 1
+
+        if trend_count >= 4:
+            score += 2
+
+        if speed >= 3:
+            score += 2
+
+        if compression == "强" and accumulation == "强":
+            score += 1
+
+        return (
+            score, pct, vol_ratio, range_ratio, trend_count, speed,
+            compression, accumulation,
+            avg_trade, avg_trade_ratio, entry_type,
+            trend_1m, trend_5m, trend_15m, trend_resonance,
+            predict_dir, predict_pct
+        )
 
     except Exception as e:
-        print("[评分异常]", e)
-        return 0,0,0,0,0,0,"弱","弱",0,0,"散户","未知","未知","未知","震荡","未知",0
-
+        print("[评分异常]", symbol, e)
+        return (
+            0,0,0,0,0,0,
+            "弱","弱",
+            0,0,"散户",
+            "未知","未知","未知","震荡",
+            "未知",0
+        )
 # =====================================================
 # 🔧修改：加入“进入观察池逻辑”
 # =====================================================
