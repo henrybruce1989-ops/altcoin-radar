@@ -152,25 +152,25 @@ def calc_score(df, symbol):
         # =====================================================
         try:
             trades = client.futures_recent_trades(symbol=symbol, limit=200)
-
+        
             if trades:
                 trades_df = pd.DataFrame(trades)
-
-                trades_df['q'] = trades_df['q'].astype(float)
-                trades_df['p'] = trades_df['p'].astype(float)
-                trades_df['value'] = trades_df['q'] * trades_df['p']
-
-                total_value = trades_df['value'].sum()
+        
+                # ⭐最稳写法
+                trades_df['quoteQty'] = trades_df['quoteQty'].astype(float)
+        
+                total_value = trades_df['quoteQty'].sum()
                 trade_count = len(trades_df)
-
+        
                 avg_trade = total_value / (trade_count + 1e-6)
-
+        
                 kline_value = df['c'].iloc[-1] * df['v'].iloc[-1]
                 avg_trade_ratio = avg_trade / (kline_value + 1e-6)
+        
             else:
                 avg_trade = 0
                 avg_trade_ratio = 0
-
+        
         except Exception as e:
             print("[资金质量异常]", symbol, e)
             avg_trade = 0
