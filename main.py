@@ -1,305 +1,319 @@
 # =====================================================
-# 秒级爆发雷达 PRO（Tick + 结构 + 趋势 + 冷却）
+# PRO版：三周期共振 秒级观察池雷达 + Phase推送 + EMA144趋势 + 资金质量
 # =====================================================
-
-import time
-from datetime import datetime, timedelta
-from collections import deque, defaultdict
-import requests
-from binance import ThreadedWebsocketManager
-from binance.client import Client
-import pandas as pd
 import os
+import csv
+import time
 import threading
+from datetime import datetime
+import pandas as pd
+from binance.client import Client
+# 🔧修改：删除旧WebSocket（避免爆队列）
+# from binance import ThreadedWebsocketManager
+import requests
 
 # =====================================================
-# ✅ 参数区（⭐核心调这里）
+# ========== 可调参数区域 ==========
 # =====================================================
+API_KEY = os.getenv("API_KEY", "YOUR_BINANCE_API_KEY")
+API_SECRET = os.getenv("API_SECRET", "YOUR_BINANCE_API_SECRET")
+SERVER_CHAN_KEY = os.getenv("SERVER_CHAN_KEY", "sctp14659thuntd89pzhhlsmbwynooxu")
 
-MAX_SYMBOLS = 120
-MIN_24H_USDT = 8_000_000
+MIN_24H_VOLUME = 8_000_000
+VOL_RATIO_THRESHOLD = 1.3
+RANGE_RATIO_THRESHOLD = 1.3
+TREND_COUNT_THRESHOLD = 3
+PHASE_COOLDOWN = 300
+OBSERVATION_TOPN = 80
+SCAN_INTERVAL = 15
+PHASE_MONITOR_INTERVAL = 5
+SIGNAL_CSV = "signals_Promax.csv"
+EMA_PERIOD = 144
+KLINE_LIMIT = 100
+PHASE_THRESH = 0.2
 
-WINDOW = 15
-THRESH = 0.2
-VOL_MULT = 1.2
-
-PHASE_ALERT = 2
-PHASE_TRIGGER = 3
-
-COOLDOWN = 300
-
-PUSH_KEY = "sctp14659thuntd89pzhhlsmbwynooxu"
+# ⭐新增：15秒预测参数
+PREDICT_PCT = 0.15
+PREDICT_VOL = 1.3
+PREDICT_RANGE = 1.2
+PREDICT_TREND = 2
 
 # =====================================================
 # 初始化
 # =====================================================
+client = Client(API_KEY, API_SECRET)
 
-client = Client()
-
-tick_cache = defaultdict(lambda: deque())
-vol_cache = defaultdict(lambda: deque())
-
-phase_map = {}
-cooldown_map = {}
-
+observation_pool = {}
 lock = threading.Lock()
 
 # =====================================================
-# 工具
+# ⭐新增：15秒预测函数
 # =====================================================
-
-def now():
-    return (datetime.utcnow() + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
-
-def push(title, content):
+def predict_15s(symbol):
     try:
-        requests.post(f"https://sctapi.ftqq.com/{PUSH_KEY}.send",
-                      data={"title": title, "desp": content}, timeout=5)
-    except:
-        pass
-
-def save_csv(row):
-    df = pd.DataFrame([row])
-    df.to_csv("signals_15sec.csv", mode='a',
-              header=not os.path.exists("signals.csv"),
-              index=False, encoding='utf-8-sig')
-
-# =====================================================
-# ✅ 1分钟结构分析（压缩 + 吸筹 + 速度）
-# =====================================================
-
-def structure_analysis(symbol):
-    try:
-        kl = client.futures_klines(symbol=symbol, interval='1m', limit=20)
-
-        df = pd.DataFrame(kl, columns=[
-            't','o','h','l','c','v','ct','q','n','tb','tq','ig'
-        ])
-
+        klines = client.futures_klines(symbol=symbol, interval='15s', limit=25)
+        df = pd.DataFrame(klines, columns=['t','o','h','l','c','v','ct','qav','nt','tb','tq','ig'])
         df[['o','h','l','c','v']] = df[['o','h','l','c','v']].astype(float)
 
-        # ===== 压缩 =====
-        ranges = (df['h'] - df['l'])
-        compress = ranges.tail(5).mean() < ranges.mean() * 0.7
+        vol_now = df['v'].tail(3).mean()
+        vol_hist = df['v'].mean()
+        vol_ratio = vol_now / (vol_hist + 1e-6)
 
-        # ===== 吸筹 =====
-        vol = df['v']
-        accumulation = vol.tail(3).mean() > vol.mean()
+        rng_now = (df['h'] - df['l']).tail(3).mean()
+        rng_hist = (df['h'] - df['l']).mean()
+        range_ratio = rng_now / (rng_hist + 1e-6)
 
-        # ===== 速度 =====
-        velocity = (df['c'].iloc[-1] - df['o'].iloc[-4]) / df['o'].iloc[-4] * 100
+        pct = (df['c'].iloc[-1] - df['o'].iloc[-1]) / df['o'].iloc[-1] * 100
 
-        # ===== 打标签 =====
-        score = 0
+        up = (df['c'].diff() > 0).tail(3).sum()
+        down = (df['c'].diff() < 0).tail(3).sum()
 
-        if compress:
-            score += 2
-            compress_label = "强"
+        if pct > PREDICT_PCT and vol_ratio > PREDICT_VOL and range_ratio > PREDICT_RANGE and up >= PREDICT_TREND:
+            return "↑上涨", pct
+        elif pct < -PREDICT_PCT and vol_ratio > PREDICT_VOL and range_ratio > PREDICT_RANGE and down >= PREDICT_TREND:
+            return "↓下跌", pct
         else:
-            compress_label = "弱"
-
-        if accumulation:
-            score += 2
-            acc_label = "强"
-        else:
-            acc_label = "弱"
-
-        if velocity >= 3:
-            score += 2
-            vel_label = "强"
-        elif velocity >= 1.5:
-            score += 1
-            vel_label = "中"
-        else:
-            vel_label = "弱"
-
-        return score, compress_label, acc_label, vel_label, velocity
-
-    except:
-        return 0, "弱", "弱", "弱", 0
+            return "→中性", pct
+    except Exception as e:
+        print("[15秒预测异常]", e)
+        return "未知", 0
 
 # =====================================================
-# 趋势判断
+# Server酱推送（保留）
 # =====================================================
-
-def get_trend(symbol, interval):
+def send_server_chan(title, content):
+    url = f"https://sctapi.ftqq.com/{SERVER_CHAN_KEY}.send"
+    data = {"title": title, "desp": content}
     try:
-        kl = client.futures_klines(symbol=symbol, interval=interval, limit=200)
-        df = pd.DataFrame(kl, columns=[
-            't','o','h','l','c','v','ct','q','n','tb','tq','ig'
-        ])
-        df['close'] = df['c'].astype(float)
-        df['ema144'] = df['close'].ewm(span=144).mean()
+        requests.post(url, data=data, timeout=5)
+    except Exception as e:
+        print(f"[推送失败] {e}")
 
-        above = (df['close'] > df['ema144']).sum()
-        below = (df['close'] < df['ema144']).sum()
+# =====================================================
+# CSV保存（🔧新增字段）
+# =====================================================
+def save_csv(data):
+    file_exists = os.path.isfile(SIGNAL_CSV)
+    with open(SIGNAL_CSV,"a",newline='',encoding="utf-8-sig") as f:
+        writer = csv.writer(f)
+        if not file_exists:
+            writer.writerow([
+                "time","symbol","phase","score","pct","vol_ratio","range_ratio",
+                "trend_count","speed","compression","accumulation",
+                "avg_trade","avg_trade_ratio","entry_type",
+                "trend_ema144_1m","trend_ema144_5m","trend_ema144_15m","trend_resonance",
+                "predict_dir","predict_pct"  # ⭐新增
+            ])
+        writer.writerow(data)
 
-        if above / len(df) > 0.6:
+# =====================================================
+# EMA趋势（保留）
+# =====================================================
+def get_ema_trend(symbol, interval):
+    try:
+        klines = client.futures_klines(symbol=symbol, interval=interval, limit=KLINE_LIMIT)
+        df = pd.DataFrame(klines, columns=['t','o','h','l','c','v','ct','qav','nt','tb','tq','ig'])
+        df[['o','h','l','c','v']] = df[['o','h','l','c','v']].astype(float)
+        ema = df['c'].ewm(span=EMA_PERIOD).mean()
+        last_close = df['c'].iloc[-1]
+        if last_close > ema.iloc[-1]:
             return "看涨"
-        elif below / len(df) > 0.6:
+        elif last_close < ema.iloc[-1]:
             return "看跌"
         else:
             return "震荡"
     except:
         return "未知"
 
-def multi_trend(symbol):
-    t1 = get_trend(symbol, '1m')
-    t5 = get_trend(symbol, '5m')
-    t15 = get_trend(symbol, '15m')
-
-    if t1 == t5 == t15:
-        res = "共振"
-    else:
-        res = "无共振"
-
-    return t1, t5, t15, res
-
 # =====================================================
-# 核心Tick逻辑
+# 🔧修改：评分函数加入预测
 # =====================================================
-
-def handle_trade(msg):
+def calc_score(df, symbol):
     try:
-        if 'data' not in msg:
-            return
+        last = df.iloc[-1]
+        pct = (last['c'] - last['o']) / last['o'] * 100
+        ma20_vol = df['v'].rolling(20).mean().iloc[-1]
+        vol_ratio = last['v'] / (ma20_vol + 1e-6)
 
-        data = msg['data']
-        if data['e'] != 'aggTrade':
-            return
+        rng_now = (df['h'] - df['l']).tail(3).mean()
+        rng_hist = (df['h'] - df['l']).mean()
+        range_ratio = rng_now / (rng_hist + 1e-6)
 
-        symbol = data['s']
-        price = float(data['p'])
-        qty = float(data['q'])
-        ts = time.time()
+        trend_count = max((df['c'].diff() > 0).tail(5).sum(),
+                          (df['c'].diff() < 0).tail(5).sum())
 
-        tick_cache[symbol].append((ts, price))
-        vol_cache[symbol].append((ts, price * qty))
+        speed = (df['c'].iloc[-1] - df['c'].iloc[-4]) / df['c'].iloc[-4] * 100
 
-        while tick_cache[symbol] and ts - tick_cache[symbol][0][0] > WINDOW:
-            tick_cache[symbol].popleft()
+        compression = "强" if (df['h'] - df['l']).tail(5).mean() < 0.5*(df['h'] - df['l']).mean() else "弱"
+        accumulation = "强" if df['v'].tail(5).mean() < 0.5*df['v'].mean() else "弱"
 
-        while vol_cache[symbol] and ts - vol_cache[symbol][0][0] > WINDOW:
-            vol_cache[symbol].popleft()
+        # ===== 资金质量 =====
+        trades = client.futures_trades(symbol=symbol)
+        if trades:
+            trades_df = pd.DataFrame(trades)
+            trades_df['q'] = trades_df['q'].astype(float)
+            trades_df['p'] = trades_df['p'].astype(float)
+            trades_df['value'] = trades_df['p']*trades_df['q']
+            avg_trade = trades_df['value'].mean()
+            avg_trade_ratio = avg_trade / (df['v'].mean()+1e-6)
+        else:
+            avg_trade = 0
+            avg_trade_ratio = 0
 
-        if len(tick_cache[symbol]) < 5:
-            return
+        # 🔧修改：更严格机构判断
+        if avg_trade_ratio > 3:
+            entry_type = "强机构"
+        elif avg_trade_ratio > 1.5:
+            entry_type = "中等资金"
+        else:
+            entry_type = "散户"
 
-        start_price = tick_cache[symbol][0][1]
-        pct = (price - start_price) / start_price * 100
+        # ===== EMA趋势 =====
+        trend_1m = get_ema_trend(symbol, "1m")
+        trend_5m = get_ema_trend(symbol, "5m")
+        trend_15m = get_ema_trend(symbol, "15m")
 
-        vol = sum(v for _, v in vol_cache[symbol])
-        vol_ratio = vol / (len(vol_cache[symbol]) + 1e-6)
+        trends = [trend_1m, trend_5m, trend_15m]
+        if trends.count("看涨")>=2:
+            trend_resonance = "看涨共振"
+        elif trends.count("看跌")>=2:
+            trend_resonance = "看跌共振"
+        else:
+            trend_resonance = "震荡"
 
-        with lock:
-            phase = phase_map.get(symbol, 0)
+        # ⭐新增：15秒预测
+        predict_dir, predict_pct = predict_15s(symbol)
 
-            if abs(pct) >= THRESH and vol_ratio >= VOL_MULT:
-                phase += 1
-            else:
-                phase = max(0, phase - 1)
+        # ===== 评分 =====
+        score = 0
+        if vol_ratio >= 3: score +=3
+        elif vol_ratio>=2: score +=2
+        elif vol_ratio>=1.5: score +=1
+        if range_ratio >= 1.5: score+=2
+        elif range_ratio>=1.3: score+=1
+        if trend_count>=4: score+=2
+        if speed>=3: score+=2
+        if compression=="强" and accumulation=="强": score+=1
 
-            phase_map[symbol] = phase
-
-        current_time = now()
-
-        # =============================
-        # Phase2：埋伏
-        # =============================
-        if phase == PHASE_ALERT:
-
-            key = (symbol, "alert")
-            if time.time() - cooldown_map.get(key, 0) < COOLDOWN:
-                return
-
-            cooldown_map[key] = time.time()
-
-            push(f"{symbol} ⚠️埋伏",
-                 f"{symbol}\n涨幅:{pct:.2f}%\n量:{vol_ratio:.2f}\n时间:{current_time}")
-
-        # =============================
-        # Phase4：开仓（结构过滤）
-        # =============================
-        if phase >= PHASE_TRIGGER:
-
-            key = (symbol, "entry")
-            if time.time() - cooldown_map.get(key, 0) < COOLDOWN:
-                return
-
-            # ⭐结构判断（核心）
-            s_score, comp, acc, vel_label, velocity = structure_analysis(symbol)
-
-            if s_score < 3:
-                return
-
-            cooldown_map[key] = time.time()
-
-            direction = "🚀看涨" if pct > 0 else "🔻看跌"
-
-            t1, t5, t15, res = multi_trend(symbol)
-
-            msg_text = f"""
-币对: {symbol}
-信号: {direction}
-
-【Tick】
-15秒涨幅: {pct:.2f}%
-成交量: {vol_ratio:.2f}
-
-【结构】
-压缩: {comp}
-吸筹: {acc}
-速度: {vel_label} ({velocity:.2f}%)
-
-【趋势】
-1m:{t1} 5m:{t5} 15m:{t15}
-共振:{res}
-
-时间: {current_time}
-"""
-
-            push(f"{symbol} 🚀开仓信号", msg_text)
-
-            save_csv([
-                current_time, symbol, direction,
-                pct, vol_ratio,
-                comp, acc, vel_label,
-                t1, t5, t15, res
-            ])
-
-            phase_map[symbol] = 0
+        return score, pct, vol_ratio, range_ratio, trend_count, speed, compression, accumulation, avg_trade, avg_trade_ratio, entry_type, trend_1m, trend_5m, trend_15m, trend_resonance, predict_dir, predict_pct
 
     except Exception as e:
-        print("错误:", e)
+        print("[评分异常]", e)
+        return 0,0,0,0,0,0,"弱","弱",0,0,"散户","未知","未知","未知","震荡","未知",0
 
 # =====================================================
-# 获取交易对
+# 🔧修改：加入“进入观察池逻辑”
 # =====================================================
+def update_observation_pool():
+    try:
+        tickers = client.futures_ticker()
+        symbols = [t['symbol'] for t in tickers if t['symbol'].endswith("USDT") and float(t['quoteVolume'])>=MIN_24H_VOLUME]
 
-def get_symbols():
-    tickers = client.futures_ticker()
-    symbols = [t['symbol'] for t in tickers
-               if float(t['quoteVolume']) > MIN_24H_USDT]
-    return symbols[:MAX_SYMBOLS]
+        scored_list = []
+
+        for s in symbols:
+            klines = client.futures_klines(symbol=s, interval='1m', limit=KLINE_LIMIT)
+            df = pd.DataFrame(klines, columns=['t','o','h','l','c','v','ct','qav','nt','tb','tq','ig'])
+            df[['o','h','l','c','v']] = df[['o','h','l','c','v']].astype(float)
+
+            # ⭐进入条件
+            vol_now = df['v'].tail(3).mean()
+            vol_hist = df['v'].mean()
+            cond_vol = vol_now > vol_hist * VOL_RATIO_THRESHOLD
+
+            rng_now = (df['h'] - df['l']).tail(3).mean()
+            rng_hist = (df['h'] - df['l']).mean()
+            cond_range = rng_now > rng_hist * RANGE_RATIO_THRESHOLD
+
+            trend = (df['c'].diff() > 0).tail(5).sum()
+            cond_trend = trend >= TREND_COUNT_THRESHOLD or trend <= 1
+
+            if not (cond_vol or cond_range or cond_trend):
+                continue  # ❗关键过滤（防爆）
+
+            result = calc_score(df, s)
+
+            scored_list.append({'symbol':s,'score':result[0],'df':df,
+                                'pct':result[1],'vol_ratio':result[2],'range_ratio':result[3],
+                                'trend_count':result[4],'speed':result[5],
+                                'compression':result[6],'accumulation':result[7],
+                                'avg_trade':result[8],'avg_trade_ratio':result[9],
+                                'entry_type':result[10],
+                                'trend_1m':result[11],'trend_5m':result[12],'trend_15m':result[13],
+                                'trend_resonance':result[14],
+                                'predict_dir':result[15],'predict_pct':result[16]})
+
+        scored_list.sort(key=lambda x:x['score'], reverse=True)
+        top_symbols = scored_list[:OBSERVATION_TOPN]
+
+        with lock:
+            for item in top_symbols:
+                s = item['symbol']
+                if s not in observation_pool:
+                    observation_pool[s] = {'last_signal_time': datetime.min, 'phase':1}
+                observation_pool[s].update(item)
+
+    except Exception as e:
+        print("[观察池更新异常]", e)
+
+# =====================================================
+# 🔧修改：推送增加预测信息
+# =====================================================
+def push_phase_signal(symbol, info, phase):
+    msg = f"""
+币对: {symbol}
+Phase: {phase}
+评分: {info['score']}
+涨幅: {info['pct']:.2f}%
+放量比: {info['vol_ratio']:.2f}x
+波动比: {info['range_ratio']:.2f}x
+涨幅速度: {info['speed']:.2f}%
+
+压缩: {info['compression']} 吸筹: {info['accumulation']}
+资金类型: {info['entry_type']}
+资金质量比: {info['avg_trade_ratio']:.2f}
+
+趋势: 1m:{info['trend_1m']} 5m:{info['trend_5m']} 15m:{info['trend_15m']}
+共振: {info['trend_resonance']}
+
+🚀15秒预测: {info['predict_dir']} ({info['predict_pct']:.2f}%)
+
+时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+"""
+    send_server_chan(f"{symbol} Phase{phase}", msg)
+
+# =====================================================
+# 线程（保留）
+# =====================================================
+def observation_pool_thread():
+    while True:
+        update_observation_pool()
+        time.sleep(SCAN_INTERVAL)
+
+def phase_monitor_thread():
+    while True:
+        with lock:
+            for s, info in observation_pool.items():
+                if (datetime.now() - info['last_signal_time']).total_seconds() < PHASE_COOLDOWN:
+                    continue
+                if info['phase']==1 and info['pct']>PHASE_THRESH:
+                    push_phase_signal(s, info, 2)
+                    info['phase']=2
+                    info['last_signal_time']=datetime.now()
+                elif info['phase']==2 and info['pct']>PHASE_THRESH:
+                    push_phase_signal(s, info, 4)
+                    info['phase']=1
+                    info['last_signal_time']=datetime.now()
+        time.sleep(PHASE_MONITOR_INTERVAL)
 
 # =====================================================
 # 启动
 # =====================================================
+if __name__=="__main__":
+    threading.Thread(target=observation_pool_thread, daemon=True).start()
+    threading.Thread(target=phase_monitor_thread, daemon=True).start()
 
-def start():
-    symbols = get_symbols()
-
-    streams = [f"{s.lower()}@aggTrade" for s in symbols]
-
-    twm = ThreadedWebsocketManager()
-    twm.start()
-
-    twm.start_multiplex_socket(callback=handle_trade, streams=streams)
+    print("🚀 PRO终极系统运行中（稳定版）")
 
     while True:
-        print(f"[{now()}] 运行中 | 监控:{len(symbols)}")
-        time.sleep(10)
-
-if __name__ == "__main__":
-    print("🚀 PRO版本启动（结构+趋势）")
-    start()
+        time.sleep(1)
