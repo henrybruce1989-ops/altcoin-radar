@@ -1,5 +1,5 @@
 # =====================================================
-# 全市场 Phase2 WebSocket 实时监控（python-binance版）
+# 全市场 Phase2 WebSocket 实时监控（python-binance最新兼容版）
 # =====================================================
 import os, csv, time, threading
 from datetime import datetime, timezone, timedelta
@@ -7,7 +7,7 @@ from collections import deque
 import pandas as pd
 import requests
 from binance.client import Client
-from binance.streams import ThreadedWebsocketManager
+from binance.websockets import BinanceSocketManager
 
 # =====================================================
 # 配置参数
@@ -31,9 +31,7 @@ OBSERVATION_TOPN = 200
 # 初始化客户端
 # =====================================================
 client = Client(API_KEY, API_SECRET)
-twm = ThreadedWebsocketManager(api_key=API_KEY, api_secret=API_SECRET)
-twm.start()
-
+bsm = BinanceSocketManager(client)
 trade_queues = {}        # symbol -> deque
 observation_pool = {}    # symbol -> phase状态 + 上次推送
 lock = threading.Lock()
@@ -130,11 +128,12 @@ def phase_monitor(symbol):
             vol_hist = pd.Series([t['qty'] for t in trade_queues[symbol]]).mean() * len(trades)
             vol_ratio = vol_now / (vol_hist+1e-6)
 
-            # ⭐ 新增 range_ratio
+            # range_ratio
             rng_now = max(t['price'] for t in trades) - min(t['price'] for t in trades)
             rng_hist = max(t['price'] for t in trade_queues[symbol]) - min(t['price'] for t in trade_queues[symbol])
             range_ratio = rng_now / (rng_hist + 1e-6) if rng_hist>0 else 0
 
+            # 资金质量比 mq_ratio
             mq_ratio = pd.Series([t['quoteQty'] for t in trades]).mean() / (pd.Series([t['quoteQty'] for t in trade_queues[symbol]]).mean()+1e-6)
             speed = (trades[-1]['price'] - trades[0]['price']) / trades[0]['price'] * 100
 
@@ -208,9 +207,10 @@ if __name__=="__main__":
     symbols = get_top_symbols()
     for s in symbols:
         # WebSocket订阅每笔成交
-        twm.start_aggtrade_socket(callback=trade_callback, symbol=s.lower())
+        bsm.start_aggtrade_socket(s.lower(), trade_callback)
         # Phase2监控线程
         threading.Thread(target=phase_monitor,args=(s,),daemon=True).start()
     print(f"🚀 全市场 Phase2 WebSocket监控启动，监控币种数: {len(symbols)}")
+    bsm.start()
     while True:
         time.sleep(1)
