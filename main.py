@@ -148,23 +148,43 @@ def calc_score(df, symbol):
         accumulation = "强" if df['v'].tail(5).mean() < 0.5*df['v'].mean() else "弱"
 
         # ===== 资金质量 =====
-        trades = client.futures_trades(symbol=symbol)
+        # ⭐修改：资金质量计算（稳定版）
+    try:
+        trades = client.futures_recent_trades(symbol=symbol, limit=200)
         if trades:
             trades_df = pd.DataFrame(trades)
+    
             trades_df['q'] = trades_df['q'].astype(float)
             trades_df['p'] = trades_df['p'].astype(float)
-            trades_df['value'] = trades_df['p']*trades_df['q']
-            avg_trade = trades_df['value'].mean()
-            avg_trade_ratio = avg_trade / (df['v'].mean()+1e-6)
+    
+            # 成交额
+            trades_df['value'] = trades_df['q'] * trades_df['p']
+    
+            total_value = trades_df['value'].sum()
+            trade_count = len(trades_df)
+    
+            # 平均单笔资金
+            avg_trade = total_value / (trade_count + 1e-6)
+    
+            # ⭐关键：用K线成交额做归一化（更合理）
+            kline_value = df['c'].iloc[-1] * df['v'].iloc[-1]
+    
+            avg_trade_ratio = avg_trade / (kline_value + 1e-6)
+    
         else:
             avg_trade = 0
             avg_trade_ratio = 0
 
-        # 🔧修改：更严格机构判断
-        if avg_trade_ratio > 3:
-            entry_type = "强机构"
-        elif avg_trade_ratio > 1.5:
-            entry_type = "中等资金"
+    except Exception as e:
+        print("[资金质量异常]", e)
+        avg_trade = 0
+        avg_trade_ratio = 0
+
+        # ⭐修改：更真实的资金分类
+        if avg_trade > 5000:
+            entry_type = "机构"
+        elif avg_trade > 1000:
+            entry_type = "中户"
         else:
             entry_type = "散户"
 
