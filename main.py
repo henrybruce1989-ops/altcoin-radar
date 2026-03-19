@@ -51,7 +51,7 @@ lock = threading.Lock()
 # =====================================================
 def predict_15s(symbol):
     try:
-        klines = client.futures_klines(symbol=symbol, interval='15s', limit=25)
+        klines = client.futures_klines(symbol=symbol, interval='1m', limit=25)
         df = pd.DataFrame(klines, columns=['t','o','h','l','c','v','ct','qav','nt','tb','tq','ig'])
         df[['o','h','l','c','v']] = df[['o','h','l','c','v']].astype(float)
 
