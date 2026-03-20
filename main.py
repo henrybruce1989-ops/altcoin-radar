@@ -1,287 +1,165 @@
-# =====================================================
-# PRO++ v2：全异步 Tick级引擎（最终稳定版）
-# =====================================================
-
 import asyncio
 import time
+import aiohttp
 import pandas as pd
 from collections import deque, defaultdict
 from datetime import datetime
-import requests
-
 from binance import AsyncClient, BinanceSocketManager
 
 # =====================================================
-# 参数
+# 配置参数
 # =====================================================
 API_KEY = ""
 API_SECRET = ""
-SERVER_CHAN_KEY = ""
+SERVER_CHAN_KEY = "sctp14659thuntd89pzhhlsmbwynooxu"
 
-MIN_24H_VOLUME = 8_000_000
+MIN_24H_VOLUME = 8_000_000  # 24h成交额筛选
+PHASE_THRESH_PCT = 0.6      # 涨幅阈值
+VOL_RATIO_THRESHOLD = 1.5   # 放量倍数
+EMA_PERIOD = 144            # 均线周期
+TREND_WINDOW = 100          # 趋势统计窗口
+TREND_RATIO = 0.7           # 占比阈值（70%时间在上方为看涨）
 
-PHASE_THRESH_PCT = 0.6
-VOL_RATIO_THRESHOLD = 1.5
-
-PHASE_COOLDOWN = 30        # 短冷却
-PHASE_WINDOW = 180         # 3分钟窗口
-
-KLINE_MAX = 200
+PHASE_COOLDOWN = 60         # 同币种同Phase冷却(秒)
+KLINE_MAX = 300             # 内存保留K线数量
 
 # =====================================================
-# 全局数据结构
+# 全局数据
 # =====================================================
-kline_1m = defaultdict(lambda: deque(maxlen=KLINE_MAX))
-kline_5m = defaultdict(lambda: deque(maxlen=KLINE_MAX))
-kline_15m = defaultdict(lambda: deque(maxlen=KLINE_MAX))
-
-current_kline = {}
-
+kline_data = defaultdict(lambda: deque(maxlen=KLINE_MAX))
 last_push_time = {}
-signal_window = defaultdict(deque)
-last_signal_kline = {}
-
-signal_queue = asyncio.PriorityQueue()
 
 # =====================================================
-# 推送
+# 趋势判定引擎：K线运行占比逻辑
 # =====================================================
-def send_server_chan(title, content):
-    url = f"https://sctapi.ftqq.com/{SERVER_CHAN_KEY}.send"
-    try:
-        requests.post(url, data={"title": title, "desp": content}, timeout=5)
-    except:
-        pass
-
-# =====================================================
-# Tick → 1m K线
-# =====================================================
-def update_kline(symbol, price, qty, ts):
-    minute = ts // 60000
-
-    if symbol not in current_kline:
-        current_kline[symbol] = {
-            "minute": minute,
-            "o": price, "h": price, "l": price, "c": price, "v": qty
-        }
-        return False
-
-    k = current_kline[symbol]
-
-    if minute == k["minute"]:
-        k["h"] = max(k["h"], price)
-        k["l"] = min(k["l"], price)
-        k["c"] = price
-        k["v"] += qty
-        return False
-    else:
-        # 完成K线
-        kline_1m[symbol].append(k.copy())
-        aggregate_mtf(symbol)
-
-        # 新K线
-        current_kline[symbol] = {
-            "minute": minute,
-            "o": price, "h": price, "l": price, "c": price, "v": qty
-        }
-        return True
-
-# =====================================================
-# 多周期聚合
-# =====================================================
-def aggregate_mtf(symbol):
-    data = list(kline_1m[symbol])
-    if len(data) < 15:
-        return
-
+def get_trend_quality(symbol):
+    data = list(kline_data[symbol])
+    if len(data) < (EMA_PERIOD + TREND_WINDOW):
+        return "初始化中", 0
+    
     df = pd.DataFrame(data)
+    # 计算 EMA144
+    ema = df['c'].ewm(span=EMA_PERIOD, adjust=False).mean()
+    
+    # 取最后 100 根进行占比统计
+    last_100_c = df['c'].tail(TREND_WINDOW)
+    last_100_ema = ema.tail(TREND_WINDOW)
+    
+    # 计算在均线上方的 K 线数量
+    above_count = (last_100_c > last_100_ema).sum()
+    ratio = above_count / TREND_WINDOW
 
-    df5 = df.groupby(df.index // 5).agg({
-        'o': 'first','h': 'max','l': 'min','c': 'last','v': 'sum'
-    })
-    kline_5m[symbol] = deque(df5.to_dict("records"), maxlen=KLINE_MAX)
-
-    df15 = df.groupby(df.index // 15).agg({
-        'o': 'first','h': 'max','l': 'min','c': 'last','v': 'sum'
-    })
-    kline_15m[symbol] = deque(df15.to_dict("records"), maxlen=KLINE_MAX)
-
-# =====================================================
-# EMA趋势
-# =====================================================
-def ema_trend(df):
-    if len(df) < 20:
-        return "未知"
-    ema = df['c'].ewm(span=144).mean()
-    if df['c'].iloc[-1] > ema.iloc[-1]:
-        return "看涨"
-    elif df['c'].iloc[-1] < ema.iloc[-1]:
-        return "看跌"
-    return "震荡"
-
-# =====================================================
-# 评分
-# =====================================================
-def calc_score(symbol):
-    if len(kline_1m[symbol]) < 20:
-        return None
-
-    df = pd.DataFrame(kline_1m[symbol])
-    last = df.iloc[-1]
-
-    pct = (last['c'] - last['o']) / last['o'] * 100
-    vol_ma = df['v'].rolling(20).mean().iloc[-1]
-    vol_ratio = last['v'] / (vol_ma + 1e-6)
-
-    score = 0
-    if vol_ratio > 2: score += 2
-    if abs(pct) > 1: score += 2
-
-    trend_1m = ema_trend(df)
-    trend_5m = ema_trend(pd.DataFrame(kline_5m[symbol])) if kline_5m[symbol] else "未知"
-    trend_15m = ema_trend(pd.DataFrame(kline_15m[symbol])) if kline_15m[symbol] else "未知"
-
-    return {
-        "symbol": symbol,
-        "score": score,
-        "pct": pct,
-        "vol_ratio": vol_ratio,
-        "trend": f"{trend_1m}/{trend_5m}/{trend_15m}"
-    }
-
-# =====================================================
-# 信号检测（终极过滤版）
-# =====================================================
-async def detect_signal(symbol):
-
-    res = calc_score(symbol)
-    if not res:
-        return
-
-    pct = res["pct"]
-    vol = res["vol_ratio"]
-
-    if abs(pct) >= PHASE_THRESH_PCT and vol >= VOL_RATIO_THRESHOLD:
-        phase = 2
-    elif abs(pct) >= PHASE_THRESH_PCT * 1.5:
-        phase = 4
+    if ratio >= TREND_RATIO:
+        return "看涨", ratio
+    elif ratio <= (1 - TREND_RATIO):
+        return "看跌", ratio
     else:
-        return
+        return "震荡", ratio
 
+# =====================================================
+# 核心计算与信号匹配
+# =====================================================
+async def check_signal(symbol):
+    trend, ratio = get_trend_quality(symbol)
+    
+    # 获取最新一根K线数据计算涨幅和放量
+    df = pd.DataFrame(list(kline_data[symbol]))
+    last = df.iloc[-1]
+    vol_ma20 = df['v'].rolling(20).mean().iloc[-1]
+    
+    pct = (last['c'] - last['o']) / last['o'] * 100
+    vol_ratio = last['v'] / (vol_ma20 + 1e-9)
+
+    # 判定 Phase
+    phase = 0
+    if abs(pct) >= PHASE_THRESH_PCT * 1.5:
+        phase = 4
+    elif abs(pct) >= PHASE_THRESH_PCT and vol_ratio >= VOL_RATIO_THRESHOLD:
+        phase = 2
+    
+    if phase == 0: return
+
+    # 冷却与重复检查
     now = time.time()
-    key = (symbol, phase)
-
-    # =========================
-    # 同一K线去重
-    # =========================
-    kline_id = current_kline[symbol]["minute"]
-    if last_signal_kline.get(key) == kline_id:
-        return
-    last_signal_kline[key] = kline_id
-
-    # =========================
-    # 冷却过滤
-    # =========================
-    if key in last_push_time:
-        if now - last_push_time[key] < PHASE_COOLDOWN:
-            return
-
-    # =========================
-    # 3分钟窗口过滤
-    # =========================
-    window = signal_window[key]
-
-    while window and now - window[0] > PHASE_WINDOW:
-        window.popleft()
-
-    if len(window) >= 1:
+    if now - last_push_time.get((symbol, phase), 0) < PHASE_COOLDOWN:
         return
 
-    window.append(now)
-    last_push_time[key] = now
+    last_push_time[(symbol, phase)] = now
+    
+    # 构造推送内容
+    msg = (f"币对: {symbol} | Phase {phase}\n"
+           f"趋势状态: {trend} (占比:{ratio:.2%})\n"
+           f"当前涨幅: {pct:.2f}%\n"
+           f"放量比率: {vol_ratio:.2f}x\n"
+           f"实时价格: {last['c']}\n"
+           f"时间: {datetime.now().strftime('%M:%S')}")
+    
+    print(f"核心信号触发: {symbol} P{phase} | {trend}")
+    asyncio.create_task(push_to_server_chan(f"{symbol} P{phase}", msg))
 
-    # =========================
-    # 入优先队列
-    # =========================
-    await signal_queue.put((-res["score"], res, phase))
-
-# =====================================================
-# 推送Worker
-# =====================================================
-async def signal_worker():
-    while True:
-        score, res, phase = await signal_queue.get()
-
-        msg = f"""
-币对: {res['symbol']}
-Phase: {phase}
-Score: {-score}
-涨幅: {res['pct']:.2f}%
-放量: {res['vol_ratio']:.2f}
-趋势: {res['trend']}
-时间: {datetime.now()}
-"""
-        send_server_chan(f"{res['symbol']} Phase{phase}", msg)
+async def push_to_server_chan(title, content):
+    if not SERVER_CHAN_KEY: return
+    url = f"https://sctapi.ftqq.com/{SERVER_CHAN_KEY}.send"
+    async with aiohttp.ClientSession() as session:
+        try:
+            await session.post(url, data={"title": title, "desp": content}, timeout=5)
+        except: pass
 
 # =====================================================
-# WS分片
+# 数据预热：防止启动时的指标虚假
 # =====================================================
-async def run_ws_shard(client, symbols):
+async def preload_data(client, symbols):
+    print(f"⏳ 正在为 {len(symbols)} 个币种预加载 300 根历史K线...")
+    for s in symbols:
+        try:
+            klines = await client.futures_klines(symbol=s, interval='1m', limit=300)
+            for k in klines:
+                kline_data[s].append({'o':float(k[1]), 'h':float(k[2]), 'l':float(k[3]), 'c':float(k[4]), 'v':float(k[5])})
+        except Exception as e:
+            print(f"预加载 {s} 失败: {e}")
+        await asyncio.sleep(0.05) # 避开频率限制
+    print("✅ 预加载完成，指标已校准。")
+
+# =====================================================
+# WebSocket 接收引擎
+# =====================================================
+async def run_shard(client, symbols):
     bm = BinanceSocketManager(client)
-    streams = [f"{s.lower()}@aggTrade" for s in symbols]
-
-    ms = bm.multiplex_socket(streams)
-
-    async with ms as stream:
+    # 使用 miniTicker 获取每秒最新的价格和成交量聚合
+    async with bm.multiplex_socket([f"{s.lower()}@miniTicker" for s in symbols]) as stream:
         while True:
             try:
                 msg = await stream.recv()
-                data = msg.get("data", {})
-
-                symbol = data.get("s")
-                price = float(data.get("p", 0))
-                qty = float(data.get("q", 0))
-                ts = data.get("T", 0)
-
-                new_kline = update_kline(symbol, price, qty, ts)
-
-                # 只在新K线完成后检测（极大降噪）
-                if new_kline:
-                    await detect_signal(symbol)
-
+                res = msg.get('data', {})
+                s = res.get('s')
+                if s:
+                    # 实时模拟 1m K线更新
+                    kline_data[s].append({
+                        'o': float(res['o']), 'h': float(res['h']),
+                        'l': float(res['l']), 'c': float(res['c']), 'v': float(res['v'])
+                    })
+                    await check_signal(s)
             except Exception as e:
-                print("WS异常:", e)
-                await asyncio.sleep(1)
+                print(f"WS分片运行异常: {e}")
+                await asyncio.sleep(5)
 
-# =====================================================
-# 主函数
-# =====================================================
 async def main():
     client = await AsyncClient.create(API_KEY, API_SECRET)
+    try:
+        # 获取市场列表
+        info = await client.futures_ticker()
+        symbols = [t['symbol'] for t in info if t['symbol'].endswith("USDT") 
+                   and float(t['quoteVolume']) > MIN_24H_VOLUME]
+        
+        await preload_data(client, symbols)
+        
+        # 分片启动（每20个币一个Task）
+        shard_size = 20
+        tasks = [run_shard(client, symbols[i:i+shard_size]) for i in range(0, len(symbols), shard_size)]
+        print(f"🚀 系统已上线，监控中...")
+        await asyncio.gather(*tasks)
+    finally:
+        await client.close_connection()
 
-    tickers = await client.futures_ticker()
-    symbols = [
-        t['symbol'] for t in tickers
-        if t['symbol'].endswith("USDT") and float(t['quoteVolume']) > MIN_24H_VOLUME
-    ]
-
-    print(f"交易对数量: {len(symbols)}")
-
-    shard_size = 15
-    shards = [symbols[i:i + shard_size] for i in range(0, len(symbols), shard_size)]
-
-    tasks = []
-
-    for shard in shards:
-        tasks.append(run_ws_shard(client, shard))
-
-    tasks.append(signal_worker())
-
-    await asyncio.gather(*tasks)
-
-# =====================================================
-# 启动
-# =====================================================
 if __name__ == "__main__":
-    print("🚀 PRO++ v2 启动（Tick级 + 去重 + 分片 + 队列）")
     asyncio.run(main())
