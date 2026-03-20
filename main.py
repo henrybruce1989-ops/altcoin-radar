@@ -14,8 +14,8 @@ API_SECRET = ""
 SERVER_CHAN_KEY = "sctp14659thuntd89pzhhlsmbwynooxu"
 
 MIN_24H_VOLUME = 8_000_000  # 24h成交额筛选
-PHASE_THRESH_PCT = 0.8      # 涨幅阈值
-VOL_RATIO_THRESHOLD = 1.5   # 放量倍数
+PHASE_THRESH_PCT = 1.2      # 涨幅阈值
+VOL_RATIO_THRESHOLD = 2   # 放量倍数
 EMA_PERIOD = 144            # 均线周期
 TREND_WINDOW = 100          # 趋势统计窗口
 TREND_RATIO = 0.7           # 占比阈值（70%时间在上方为看涨）
