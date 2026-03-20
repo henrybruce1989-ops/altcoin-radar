@@ -15,7 +15,7 @@ from binance.client import Client
 # =====================================================
 API_KEY = os.getenv("API_KEY", "")
 API_SECRET = os.getenv("API_SECRET", "")
-SERVER_CHAN_KEY = os.getenv("SERVER_CHAN_KEY", "")
+SERVER_CHAN_KEY = os.getenv("SERVER_CHAN_KEY", "sctp14659thuntd89pzhhlsmbwynooxu")
 
 # ===== 基础参数 =====
 WINDOW_SECONDS = 15              # ⭐短周期窗口（建议 10~30）
