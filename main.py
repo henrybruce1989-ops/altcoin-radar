@@ -1,5 +1,5 @@
 # =====================================================
-# PRO终极版：全市场 Phase2/Phase4 WebSocket + asyncio + 高精度低噪信号
+# PRO终极版：全市场 Phase2/Phase4 WebSocket + asyncio + 高精度低噪信号（client传入修复）
 # =====================================================
 import os
 import asyncio
@@ -18,15 +18,14 @@ API_SECRET = os.getenv("API_SECRET","YOUR_BINANCE_API_SECRET")
 SERVER_CHAN_KEY = os.getenv("SERVER_CHAN_KEY","sctp14659thuntd89pzhhlsmbwynooxu")
 
 MIN_24H_VOLUME = 8_000_000      # 只监控24h成交额大于800万的币种
-PHASE_COOLDOWN = 60             # Phase冷却时间（秒），同一个币种同一Phase内不会重复推送
+PHASE_COOLDOWN = 30             # Phase冷却时间（秒），同一个币种同一Phase内不会重复推送
 PHASE_THRESH_PCT = 0.8          # 1分钟K线涨跌幅阈值（%）
 VOL_RATIO_THRESHOLD = 1.3       # 放量比阈值
-TOP_PERCENT = 0.1              # Top5%评分
+TOP_PERCENT = 0.5              # Top5%评分
 SIGNAL_POOL_SIZE = 200           # 最近信号池长度
 EMA_PERIOD = 144                 # EMA周期
 KLINE_LIMIT = 60                 # 获取历史K线条数
-# 三连阳/三连阴判断长度
-MOMENTUM_LEN = 3
+MOMENTUM_LEN = 3                 # 三连阳/三连阴判断长度
 
 # =====================================================
 # 初始化
@@ -142,9 +141,7 @@ def calc_score(df, symbol):
         if range_ratio>=1.5: score+=2
         elif range_ratio>=1.3: score+=1
         if speed>=3: score+=2
-
-        if momentum in ["三连阳","三连阴"]:
-            score+=1
+        if momentum in ["三连阳","三连阴"]: score+=1
 
         return (score,pct,vol_ratio,range_ratio,speed,entry_type,avg_trade_ratio,trend_1m,trend_5m,trend_15m,trend_resonance,momentum)
     except:
@@ -172,9 +169,9 @@ EMA趋势(1/5/15): {info[7]}/{info[8]}/{info[9]}
     send_server_chan(f"{symbol} Phase{phase}", msg)
 
 # =====================================================
-# Phase2/Phase4逻辑
+# Phase2/Phase4逻辑（传入异步client）
 # =====================================================
-async def process_symbol(symbol):
+async def process_symbol(client, symbol):
     try:
         klines = await client.futures_klines(symbol=symbol,interval="1m",limit=KLINE_LIMIT)
         df = pd.DataFrame(klines,columns=['t','o','h','l','c','v','ct','qav','nt','tb','tq','ig'])
@@ -193,8 +190,8 @@ async def process_symbol(symbol):
                 last_push_time[key]=now
                 push_signal(symbol,phase,(score,pct,vol_ratio,range_ratio,speed,entry_type,avg_trade_ratio,trend_1m,trend_5m,trend_15m,trend_resonance,momentum))
 
-        # Phase4可以用类似逻辑
-        if abs(pct)>=PHASE_THRESH_PCT*1.5 and vol_ratio>=VOL_RATIO_THRESHOLD*1.5:  # Phase4加严格阈值
+        # Phase4条件: 加严格阈值
+        if abs(pct)>=PHASE_THRESH_PCT*1.5 and vol_ratio>=VOL_RATIO_THRESHOLD*1.5:
             phase = 4
             key=(symbol,phase)
             now=time.time()
@@ -218,7 +215,7 @@ async def monitor_all_symbols():
     batch_size=20
     for i in range(0,len(symbols),batch_size):
         batch=symbols[i:i+batch_size]
-        tasks=[process_symbol(sym) for sym in batch]
+        tasks=[process_symbol(client,sym) for sym in batch]
         await asyncio.gather(*tasks)
     await client.close_connection()
 
