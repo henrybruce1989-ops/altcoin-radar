@@ -27,10 +27,10 @@ MAX_CONCURRENT_WS = 30          # ⭐最大WebSocket并发（建议 20~50）
 BATCH_SIZE = 20                 # ⭐每批启动数量（建议 10~30）
 
 # ===== Phase触发（🔥核心）=====
-Z_THRESHOLD_PHASE2 = 2.0        # ⭐Z-score埋伏（1.8~2.5）
-Z_THRESHOLD_PHASE4 = 2.5        # ⭐Z-score开仓（2.3~3.5）
+Z_THRESHOLD_PHASE2 = 1.8        # ⭐Z-score埋伏（1.8~2.5）
+Z_THRESHOLD_PHASE4 = 2.3        # ⭐Z-score开仓（2.3~3.5）
 
-VOL_RATIO_PHASE2 = 1.2          # ⭐放量（1.1~1.5）
+VOL_RATIO_PHASE2 = 1.1          # ⭐放量（1.1~1.5）
 VOL_RATIO_PHASE4 = 1.5
 
 MQ_RATIO_PHASE2 = 1.1           # ⭐资金质量（1.05~1.3）
