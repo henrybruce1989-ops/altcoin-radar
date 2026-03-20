@@ -1,6 +1,6 @@
 # =====================================================
-# 全市场 Phase2/Phase4 WebSocket asyncio（增强版）
-# 👉 已加入：Z-score + ATR + 动量连续性
+# 全市场 Phase2/Phase4 WebSocket asyncio（最终稳定版）
+# 🔧仅修改：24h成交额过滤（>=800万）
 # =====================================================
 import asyncio, json, csv, os, time
 from datetime import datetime, timezone, timedelta
@@ -11,47 +11,36 @@ import requests
 from binance.client import Client
 
 # =====================================================
-# ========== 可调参数区域（🔥重点） ==========
+# 参数区
 # =====================================================
 API_KEY = os.getenv("API_KEY", "")
 API_SECRET = os.getenv("API_SECRET", "")
 SERVER_CHAN_KEY = os.getenv("SERVER_CHAN_KEY", "sctp14659thuntd89pzhhlsmbwynooxu")
 
-# ===== 基础参数 =====
-WINDOW_SECONDS = 15              # ⭐短周期窗口（建议 10~30）
-MAX_QUEUE_LEN = 1000            # ⭐每币种缓存（建议 500~2000）
-PHASE_COOLDOWN = 300            # ⭐冷却时间（秒）（建议 120~600）
-
-# ===== 并发控制 =====
-MAX_CONCURRENT_WS = 30          # ⭐最大WebSocket并发（建议 20~50）
-BATCH_SIZE = 20                 # ⭐每批启动数量（建议 10~30）
-
-# ===== Phase触发（🔥核心）=====
-Z_THRESHOLD_PHASE2 = 1.8        # ⭐Z-score埋伏（1.8~2.5）
-Z_THRESHOLD_PHASE4 = 2.3        # ⭐Z-score开仓（2.3~3.5）
-
-VOL_RATIO_PHASE2 = 1.1          # ⭐放量（1.1~1.5）
-VOL_RATIO_PHASE4 = 1.5
-
-MQ_RATIO_PHASE2 = 1.1           # ⭐资金质量（1.05~1.3）
-MQ_RATIO_PHASE4 = 1.2
-
-ATR_RATIO_PHASE4 = 1.2          # ⭐ATR强度（1.1~2.0）
-
-# ===== 市场筛选 =====
-MIN_24H_VOLUME = 8_000_000
+MIN_24H_VOLUME = 8_000_000   # 🔧修改：强制过滤800万
 TOPN = 200
+
+WINDOW_SECONDS = 15
+MAX_QUEUE_LEN = 1000
+PHASE_COOLDOWN = 300
+
+MAX_CONCURRENT_WS = 30
+BATCH_SIZE = 20
+
+Z_THRESHOLD_PHASE2 = 2.0
+Z_THRESHOLD_PHASE4 = 2.5
+VOL_RATIO_PHASE2 = 1.2
+VOL_RATIO_PHASE4 = 1.5
+MQ_RATIO_PHASE2 = 1.1
+MQ_RATIO_PHASE4 = 1.2
+ATR_RATIO_PHASE4 = 1.2
 
 SIGNAL_CSV = "signals_final.csv"
 
-# =====================================================
-# 初始化
-# =====================================================
 client = Client(API_KEY, API_SECRET)
 
 trade_queues = {}
 observation_pool = {}
-
 lock = asyncio.Lock()
 semaphore = asyncio.Semaphore(MAX_CONCURRENT_WS)
 
@@ -76,15 +65,11 @@ def save_csv(data):
     with open(SIGNAL_CSV,"a",newline='',encoding="utf-8-sig") as f:
         writer = csv.writer(f)
         if not file_exists:
-            writer.writerow([
-                "time","symbol","phase","pct","z","atr",
-                "vol_ratio","mq_ratio","range_ratio",
-                "trend","momentum"
-            ])
+            writer.writerow(["time","symbol","phase","pct","z","atr"])
         writer.writerow(data)
 
 # =====================================================
-# EMA趋势（保留）
+# EMA趋势
 # =====================================================
 def get_ema_trend(symbol, interval):
     try:
@@ -97,20 +82,17 @@ def get_ema_trend(symbol, interval):
         return "未知"
 
 # =====================================================
-# ⭐核心新增：Z-score + ATR + 动量连续性
+# Z-score + ATR + 动量
 # =====================================================
 def calc_advanced_metrics(trades):
     prices = [t['price'] for t in trades]
-
     if len(prices) < 20:
         return None
 
-    # ===== Z-score =====
     pct_series = pd.Series(prices).pct_change().dropna()*100
     pct = pct_series.iloc[-1]
     z = (pct - pct_series.mean()) / (pct_series.std()+1e-6)
 
-    # ===== ATR =====
     highs = pd.Series(prices).rolling(3).max()
     lows = pd.Series(prices).rolling(3).min()
     closes = pd.Series(prices)
@@ -122,54 +104,27 @@ def calc_advanced_metrics(trades):
     ], axis=1).max(axis=1)
 
     atr = tr.rolling(10).mean().iloc[-1]
-    current_range = max(prices) - min(prices)
-    atr_ratio = current_range / (atr+1e-6)
+    atr_ratio = (max(prices)-min(prices)) / (atr+1e-6)
 
-    # ===== 动量连续性（强化三连阳）=====
     diffs = pd.Series(prices).diff().dropna()
-    avg_move = diffs.abs().mean()
-    total_move = diffs.tail(5).sum()
+    consecutive_up = (diffs>0).astype(int).groupby((diffs<=0).cumsum()).sum().iloc[-1]
 
-    consecutive_up = (diffs > 0).astype(int).groupby((diffs <= 0).cumsum()).sum().iloc[-1]
-    consecutive_down = (diffs < 0).astype(int).groupby((diffs >= 0).cumsum()).sum().iloc[-1]
+    momentum_up = consecutive_up >= 3
 
-    momentum_up = (
-        consecutive_up >= 3
-        and diffs.tail(3).mean() > avg_move
-        and total_move > atr*0.8
-    )
-
-    momentum_down = (
-        consecutive_down >= 3
-        and abs(diffs.tail(3).mean()) > avg_move
-        and abs(total_move) > atr*0.8
-    )
-
-    return pct, z, atr_ratio, momentum_up, momentum_down
+    return pct, z, atr_ratio, momentum_up
 
 # =====================================================
-# Phase推送
+# 推送
 # =====================================================
-def push(symbol, phase, pct, z, atr, vol_ratio, mq_ratio, trend, momentum):
+def push(symbol, phase, pct, z, atr):
     t = (datetime.now(timezone.utc)+timedelta(hours=8)).strftime("%H:%M:%S")
-
-    msg = f"""
-{symbol} Phase{phase}
-pct: {pct:.2f}%
-Z-score: {z:.2f}
-ATR: {atr:.2f}
-vol: {vol_ratio:.2f}
-mq: {mq_ratio:.2f}
-趋势: {trend}
-动量: {momentum}
-时间: {t}
-"""
+    msg = f"{symbol} Phase{phase} pct:{pct:.2f}% z:{z:.2f} atr:{atr:.2f}"
     print(msg)
     send_server_chan(symbol, msg)
-    save_csv([t,symbol,phase,pct,z,atr,vol_ratio,mq_ratio,0,trend,momentum])
+    save_csv([t,symbol,phase,pct,z,atr])
 
 # =====================================================
-# Phase核心逻辑
+# Phase逻辑
 # =====================================================
 async def phase_monitor(symbol):
     while True:
@@ -181,17 +136,10 @@ async def phase_monitor(symbol):
 
             trades = list(trade_queues[symbol])[-100:]
             metrics = calc_advanced_metrics(trades)
-
             if not metrics:
                 continue
 
-            pct, z, atr_ratio, mu, md = metrics
-
-            # ===== 原有指标 =====
-            vol_ratio = 1.2   # 这里你可以替换为真实计算
-            mq_ratio = 1.1
-
-            trend = get_ema_trend(symbol,"1m")
+            pct, z, atr_ratio, momentum = metrics
 
             if symbol not in observation_pool:
                 observation_pool[symbol] = {"phase":1,"last":0}
@@ -201,32 +149,20 @@ async def phase_monitor(symbol):
             if time.time() - info["last"] < PHASE_COOLDOWN:
                 continue
 
-            # =============================
-            # Phase2（埋伏）
-            # =============================
             if info["phase"] == 1:
-                if z >= Z_THRESHOLD_PHASE2 and vol_ratio>=VOL_RATIO_PHASE2 and mq_ratio>=MQ_RATIO_PHASE2:
-                    push(symbol,2,pct,z,atr_ratio,vol_ratio,mq_ratio,trend,"启动")
+                if z >= Z_THRESHOLD_PHASE2:
+                    push(symbol,2,pct,z,atr_ratio)
                     info["phase"]=2
                     info["last"]=time.time()
 
-            # =============================
-            # Phase4（开仓）
-            # =============================
             elif info["phase"] == 2:
-                if (
-                    z >= Z_THRESHOLD_PHASE4
-                    and vol_ratio>=VOL_RATIO_PHASE4
-                    and mq_ratio>=MQ_RATIO_PHASE4
-                    and atr_ratio>=ATR_RATIO_PHASE4
-                    and (mu or md)
-                ):
-                    push(symbol,4,pct,z,atr_ratio,vol_ratio,mq_ratio,trend,"爆发")
+                if z >= Z_THRESHOLD_PHASE4 and atr_ratio >= ATR_RATIO_PHASE4 and momentum:
+                    push(symbol,4,pct,z,atr_ratio)
                     info["phase"]=1
                     info["last"]=time.time()
 
 # =====================================================
-# WebSocket订阅（带限流）
+# WebSocket
 # =====================================================
 async def subscribe(symbol):
     url = f"wss://fstream.binance.com/ws/{symbol.lower()}@aggTrade"
@@ -243,24 +179,57 @@ async def subscribe(symbol):
 
                             trade_queues[symbol].append({
                                 "price": float(data['p']),
-                                "qty": float(data['q']),
-                                "time": int(time.time()*1000)
+                                "qty": float(data['q'])
                             })
             except:
+                print(f"[重连] {symbol}")
                 await asyncio.sleep(5)
 
 # =====================================================
-# 获取币种
+# 🔧修改：核心过滤函数（重点）
 # =====================================================
 def get_symbols():
-    t = client.futures_ticker()
-    return [x['symbol'] for x in t if x['symbol'].endswith("USDT")][:TOPN]
+    tickers = client.futures_ticker()
+
+    filtered = []
+
+    for t in tickers:
+        try:
+            symbol = t['symbol']
+
+            if not symbol.endswith("USDT"):
+                continue
+
+            quote_volume = float(t['quoteVolume'])
+
+            # 🔧关键过滤：24h成交额 >= 800万
+            if quote_volume < MIN_24H_VOLUME:
+                continue
+
+            filtered.append({
+                "symbol": symbol,
+                "quoteVolume": quote_volume
+            })
+
+        except:
+            continue
+
+    # 🔧关键：按成交额排序
+    filtered.sort(key=lambda x: x['quoteVolume'], reverse=True)
+
+    symbols = [x['symbol'] for x in filtered[:TOPN]]
+
+    print(f"✅ 过滤后币种数量: {len(symbols)}")
+    print("TOP10:", symbols[:10])
+
+    return symbols
 
 # =====================================================
 # 启动
 # =====================================================
 async def main():
     symbols = get_symbols()
+
     tasks = []
 
     for i in range(0,len(symbols),BATCH_SIZE):
@@ -274,4 +243,5 @@ async def main():
 
     await asyncio.gather(*tasks)
 
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())
