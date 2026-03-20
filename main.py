@@ -18,10 +18,10 @@ API_SECRET = os.getenv("API_SECRET","YOUR_BINANCE_API_SECRET")
 SERVER_CHAN_KEY = os.getenv("SERVER_CHAN_KEY","sctp14659thuntd89pzhhlsmbwynooxu")
 
 MIN_24H_VOLUME = 8_000_000      # 只监控24h成交额大于800万的币种
-PHASE_COOLDOWN = 30             # Phase冷却时间（秒），同一个币种同一Phase内不会重复推送
-PHASE_THRESH_PCT = 1.2          # 1分钟K线涨跌幅阈值（%）
+PHASE_COOLDOWN = 60             # Phase冷却时间（秒），同一个币种同一Phase内不会重复推送
+PHASE_THRESH_PCT = 0.8          # 1分钟K线涨跌幅阈值（%）
 VOL_RATIO_THRESHOLD = 1.3       # 放量比阈值
-TOP_PERCENT = 0.05              # Top5%评分
+TOP_PERCENT = 0.1              # Top5%评分
 SIGNAL_POOL_SIZE = 200           # 最近信号池长度
 EMA_PERIOD = 144                 # EMA周期
 KLINE_LIMIT = 60                 # 获取历史K线条数
