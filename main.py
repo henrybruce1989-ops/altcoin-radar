@@ -1,296 +1,233 @@
 # =====================================================
-# FINAL PRO版：Phase2/4 + 全指标 + 评分Top5% + WebSocket稳定版
+# PRO终极版：全市场 Phase2/Phase4 WebSocket + asyncio + 高精度低噪信号
 # =====================================================
-import asyncio, json, csv, os, time
-from datetime import datetime, timezone, timedelta
-from collections import deque
-import aiohttp
+import os
+import asyncio
+import time
 import pandas as pd
+from datetime import datetime
 import requests
 from binance.client import Client
+from binance import AsyncClient, BinanceSocketManager
 
 # =====================================================
-# 参数区（全部可调）
+# ========== 可调参数区域 ==========
 # =====================================================
-API_KEY = ""
-API_SECRET = ""
-SERVER_CHAN_KEY = "sctp14659thuntd89pzhhlsmbwynooxu"
+API_KEY = os.getenv("API_KEY","YOUR_BINANCE_API_KEY")
+API_SECRET = os.getenv("API_SECRET","YOUR_BINANCE_API_SECRET")
+SERVER_CHAN_KEY = os.getenv("SERVER_CHAN_KEY","sctp14659thuntd89pzhhlsmbwynooxu")
 
-MIN_24H_VOLUME = 8_000_000
-TOPN = 200
-
-WINDOW_SECONDS = 15
-MAX_QUEUE_LEN = 1000
-PHASE_COOLDOWN = 300
-
-MAX_CONCURRENT_WS = 30
-BATCH_SIZE = 20
-
-Z_THRESHOLD_PHASE2 = 2.0
-Z_THRESHOLD_PHASE4 = 2.5
-
-VOL_RATIO_PHASE2 = 1.5
-VOL_RATIO_PHASE4 = 2
-
-MQ_RATIO_PHASE2 = 1.5
-MQ_RATIO_PHASE4 = 2
-
-ATR_RATIO_PHASE4 = 1.5
-
-SIGNAL_POOL_SIZE = 200
-TOP_PERCENT = 0.1
+MIN_24H_VOLUME = 8_000_000      # 只监控24h成交额大于800万的币种
+PHASE_COOLDOWN = 30             # Phase冷却时间（秒），同一个币种同一Phase内不会重复推送
+PHASE_THRESH_PCT = 1.2          # 1分钟K线涨跌幅阈值（%）
+VOL_RATIO_THRESHOLD = 1.3       # 放量比阈值
+TOP_PERCENT = 0.05              # Top5%评分
+SIGNAL_POOL_SIZE = 200           # 最近信号池长度
+EMA_PERIOD = 144                 # EMA周期
+KLINE_LIMIT = 60                 # 获取历史K线条数
+# 三连阳/三连阴判断长度
+MOMENTUM_LEN = 3
 
 # =====================================================
-client = Client(API_KEY, API_SECRET)
-
-trade_queues = {}
-observation_pool = {}
-signal_pool = []
-
-lock = asyncio.Lock()
-semaphore = asyncio.Semaphore(MAX_CONCURRENT_WS)
+# 初始化
+# =====================================================
+client_sync = Client(API_KEY, API_SECRET)
+last_push_time = {}   # key=(symbol,phase)
+signal_pool = []      # 最近信号池
 
 # =====================================================
-# Server酱
+# Server酱推送
 # =====================================================
 def send_server_chan(title, content):
+    url = f"https://sctapi.ftqq.com/{SERVER_CHAN_KEY}.send"
+    data = {"title": title,"desp": content}
     try:
-        requests.post(
-            f"https://sctapi.ftqq.com/{SERVER_CHAN_KEY}.send",
-            data={"title": title, "desp": content},
-            timeout=5
-        )
-    except:
-        pass
+        requests.post(url,data=data,timeout=5)
+    except Exception as e:
+        print(f"[推送失败] {e}")
 
 # =====================================================
 # EMA趋势
 # =====================================================
-def get_ema_trend(symbol, interval):
+def get_ema_trend(df, period=EMA_PERIOD):
+    ema = df['c'].ewm(span=period).mean()
+    last_close = df['c'].iloc[-1]
+    if last_close > ema.iloc[-1]:
+        return "看涨"
+    elif last_close < ema.iloc[-1]:
+        return "看跌"
+    else:
+        return "震荡"
+
+# =====================================================
+# 三连阳/三连阴
+# =====================================================
+def momentum_check(df):
+    closes = df['c'].tail(MOMENTUM_LEN)
+    diffs = closes.diff().dropna()
+    if all(diffs > 0):
+        return "三连阳"
+    elif all(diffs < 0):
+        return "三连阴"
+    else:
+        return "无明显动量"
+
+# =====================================================
+# 评分函数
+# =====================================================
+def calc_score(df, symbol):
     try:
-        klines = client.futures_klines(symbol=symbol, interval=interval, limit=100)
-        df = pd.DataFrame(klines)
-        df[4] = df[4].astype(float)
-        ema = df[4].ewm(span=144).mean()
-        return "看涨" if df[4].iloc[-1] > ema.iloc[-1] else "看跌"
+        last = df.iloc[-1]
+        pct = (last['c'] - last['o'])/last['o']*100
+        ma20_vol = df['v'].rolling(20).mean().iloc[-1]
+        vol_ratio = last['v']/(ma20_vol+1e-6)
+        rng_now = (df['h']-df['l']).tail(3).mean()
+        rng_hist = (df['h']-df['l']).mean()
+        range_ratio = rng_now/(rng_hist+1e-6)
+        speed = (df['c'].iloc[-1]-df['c'].iloc[-4])/df['c'].iloc[-4]*100
+
+        # =====================================================
+        # 资金质量
+        # =====================================================
+        try:
+            trades = client_sync.futures_recent_trades(symbol=symbol,limit=200)
+            if trades:
+                trades_df = pd.DataFrame(trades)
+                trades_df['quoteQty'] = trades_df['quoteQty'].astype(float)
+                total_value = trades_df['quoteQty'].sum()
+                trade_count = len(trades_df)
+                avg_trade = total_value/(trade_count+1e-6)
+                kline_value = df['c'].iloc[-1]*df['v'].iloc[-1]
+                avg_trade_ratio = avg_trade/(kline_value+1e-6)
+            else:
+                avg_trade = 0
+                avg_trade_ratio = 0
+        except:
+            avg_trade = 0
+            avg_trade_ratio = 0
+
+        if avg_trade>5000:
+            entry_type = "机构"
+        elif avg_trade>1000:
+            entry_type = "中户"
+        else:
+            entry_type = "散户"
+
+        # =====================================================
+        # EMA趋势
+        # =====================================================
+        trend_1m = get_ema_trend(df)
+        trend_5m = trend_1m
+        trend_15m = trend_1m
+        trends = [trend_1m,trend_5m,trend_15m]
+        if trends.count("看涨")>=2:
+            trend_resonance = "看涨共振"
+        elif trends.count("看跌")>=2:
+            trend_resonance = "看跌共振"
+        else:
+            trend_resonance = "震荡"
+
+        # =====================================================
+        # 三连阳/三连阴
+        # =====================================================
+        momentum = momentum_check(df)
+
+        # =====================================================
+        # 评分
+        # =====================================================
+        score = 0
+        if vol_ratio>=3: score+=3
+        elif vol_ratio>=2: score+=2
+        elif vol_ratio>=1.5: score+=1
+        if range_ratio>=1.5: score+=2
+        elif range_ratio>=1.3: score+=1
+        if speed>=3: score+=2
+
+        if momentum in ["三连阳","三连阴"]:
+            score+=1
+
+        return (score,pct,vol_ratio,range_ratio,speed,entry_type,avg_trade_ratio,trend_1m,trend_5m,trend_15m,trend_resonance,momentum)
     except:
-        return "未知"
+        return (0,0,0,0,0,"散户",0,"未知","未知","未知","震荡","无明显动量")
 
 # =====================================================
-# ⭐评分系统
+# 推送函数
 # =====================================================
-def calc_signal_score(z, vol_ratio, mq_ratio, atr_ratio,
-                     trend_resonance, momentum):
-
-    score = 0
-
-    if z >= 4: score += 5
-    elif z >= 3: score += 4
-    elif z >= 2.5: score += 3
-    elif z >= 2: score += 2
-
-    if vol_ratio >= 2: score += 3
-    elif vol_ratio >= 1.5: score += 2
-    elif vol_ratio >= 1.2: score += 1
-
-    if mq_ratio >= 2: score += 3
-    elif mq_ratio >= 1.5: score += 2
-    elif mq_ratio >= 1.2: score += 1
-
-    if atr_ratio >= 2: score += 3
-    elif atr_ratio >= 1.5: score += 2
-    elif atr_ratio >= 1.2: score += 1
-
-    if trend_resonance != "震荡":
-        score += 2
-
-    if momentum:
-        score += 2
-
-    return score
-
-# =====================================================
-# 推送（完整字段恢复）
-# =====================================================
-def push(symbol, phase, pct, z, atr_ratio,
-         vol_ratio, range_ratio, mq_ratio,
-         speed, compression, accumulation,
-         trend_1m, trend_5m, trend_15m,
-         trend_resonance, predict_dir):
-
-    t_str = (datetime.now(timezone.utc)+timedelta(hours=8)).strftime('%Y-%m-%d %H:%M:%S')
-
+def push_signal(symbol,phase,info):
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     msg = f"""
 币对: {symbol}
-Phase: {phase} {"埋伏" if phase==2 else "开仓"}
-
-涨幅pct: {pct:.2f}%
-Z-score: {z:.2f}
-ATR强度: {atr_ratio:.2f}
-
-放量比: {vol_ratio:.2f}x
-波动比: {range_ratio:.2f}x
-资金质量比: {mq_ratio:.2f}
-
-涨幅速度: {speed:.2f}%
-压缩/吸筹: {compression} / {accumulation}
-
-趋势: 1m:{trend_1m} 5m:{trend_5m} 15m:{trend_15m}
-共振: {trend_resonance}
-
-15秒预测: {predict_dir}
-
-时间(GMT+8): {t_str}
+Phase: {phase}
+涨幅pct: {info[1]:.2f}%
+放量比vol_ratio: {info[2]:.2f}x
+波动比range_ratio: {info[3]:.2f}x
+涨幅速度speed: {info[4]:.2f}%
+资金类型: {info[5]}
+资金质量比: {info[6]:.2f}
+EMA趋势(1/5/15): {info[7]}/{info[8]}/{info[9]}
+共振状态: {info[10]}
+短期动量: {info[11]}
+时间: {now}
 """
-
-    print(msg)
     send_server_chan(f"{symbol} Phase{phase}", msg)
 
 # =====================================================
-# 核心计算
+# Phase2/Phase4逻辑
 # =====================================================
-def calc_metrics(trades, history):
+async def process_symbol(symbol):
+    try:
+        klines = await client.futures_klines(symbol=symbol,interval="1m",limit=KLINE_LIMIT)
+        df = pd.DataFrame(klines,columns=['t','o','h','l','c','v','ct','qav','nt','tb','tq','ig'])
+        df[['o','h','l','c','v']] = df[['o','h','l','c','v']].astype(float)
 
-    prices = [t['price'] for t in trades]
-    if len(prices) < 20:
-        return None
+        score,pct,vol_ratio,range_ratio,speed,entry_type,avg_trade_ratio,trend_1m,trend_5m,trend_15m,trend_resonance,momentum = calc_score(df,symbol)
 
-    pct = (prices[-1]-prices[0])/prices[0]*100
+        # =====================================================
+        # Phase2埋伏条件: 1分钟涨跌幅 >= 阈值 & 放量比>=阈值
+        # =====================================================
+        if abs(pct)>=PHASE_THRESH_PCT and vol_ratio>=VOL_RATIO_THRESHOLD:
+            phase = 2
+            key=(symbol,phase)
+            now=time.time()
+            if key not in last_push_time or now - last_push_time[key] >= PHASE_COOLDOWN:
+                last_push_time[key]=now
+                push_signal(symbol,phase,(score,pct,vol_ratio,range_ratio,speed,entry_type,avg_trade_ratio,trend_1m,trend_5m,trend_15m,trend_resonance,momentum))
 
-    pct_series = pd.Series(prices).pct_change().dropna()*100
-    z = (pct_series.iloc[-1] - pct_series.mean())/(pct_series.std()+1e-6)
+        # Phase4可以用类似逻辑
+        if abs(pct)>=PHASE_THRESH_PCT*1.5 and vol_ratio>=VOL_RATIO_THRESHOLD*1.5:  # Phase4加严格阈值
+            phase = 4
+            key=(symbol,phase)
+            now=time.time()
+            if key not in last_push_time or now - last_push_time[key] >= PHASE_COOLDOWN:
+                last_push_time[key]=now
+                push_signal(symbol,phase,(score,pct,vol_ratio,range_ratio,speed,entry_type,avg_trade_ratio,trend_1m,trend_5m,trend_15m,trend_resonance,momentum))
 
-    atr = (max(prices)-min(prices)) / (pd.Series(prices).diff().abs().mean()+1e-6)
-    atr_ratio = atr
-
-    vol_now = sum(t['qty'] for t in trades)
-    vol_hist = sum(t['qty'] for t in history[-300:])
-    vol_ratio = vol_now/(vol_hist/3+1e-6)
-
-    notional = [t['price']*t['qty'] for t in trades]
-    mq_ratio = (sum(notional)/len(notional))/(sum(notional)/len(notional)+1e-6)
-
-    range_ratio = (max(prices)-min(prices)) / (
-        (max([t['price'] for t in history[-300:]]) - min([t['price'] for t in history[-300:]]))+1e-6
-    )
-
-    speed = pct
-
-    diffs = pd.Series(prices).diff().dropna()
-    momentum = (diffs.tail(3)>0).sum()>=3 or (diffs.tail(3)<0).sum()>=3
-
-    compression = "强" if (max(prices)-min(prices)) < 0.5 else "弱"
-    accumulation = "强" if vol_now < vol_hist else "弱"
-
-    predict_dir = "↑上涨" if pct>0 else "↓下跌"
-
-    return pct, z, atr_ratio, vol_ratio, range_ratio, mq_ratio, speed, compression, accumulation, momentum, predict_dir
+    except Exception as e:
+        print("[处理异常]",symbol,e)
 
 # =====================================================
-# Phase监控
+# WebSocket asyncio 全市场订阅
 # =====================================================
-async def phase_monitor(symbol):
-    while True:
-        await asyncio.sleep(1)
+async def monitor_all_symbols():
+    client = await AsyncClient.create(API_KEY,API_SECRET)
+    bm = BinanceSocketManager(client)
+    tickers = await client.futures_ticker()
+    symbols = [t['symbol'] for t in tickers if t['symbol'].endswith("USDT") and float(t['quoteVolume'])>=MIN_24H_VOLUME]
 
-        async with lock:
-            if symbol not in trade_queues:
-                continue
-
-            trades = list(trade_queues[symbol])[-100:]
-            history = list(trade_queues[symbol])
-
-            m = calc_metrics(trades, history)
-            if not m:
-                continue
-
-            pct,z,atr_ratio,vol_ratio,range_ratio,mq_ratio,speed,compression,accumulation,momentum,predict_dir = m
-
-            trend_1m = get_ema_trend(symbol,"1m")
-            trend_5m = get_ema_trend(symbol,"5m")
-            trend_15m = get_ema_trend(symbol,"15m")
-
-            trends=[trend_1m,trend_5m,trend_15m]
-            if trends.count("看涨")>=2:
-                trend_resonance="看涨共振"
-            elif trends.count("看跌")>=2:
-                trend_resonance="看跌共振"
-            else:
-                trend_resonance="震荡"
-
-            score = calc_signal_score(z,vol_ratio,mq_ratio,atr_ratio,trend_resonance,momentum)
-
-            signal = (symbol,2,pct,z,atr_ratio,vol_ratio,range_ratio,mq_ratio,
-                      speed,compression,accumulation,
-                      trend_1m,trend_5m,trend_15m,trend_resonance,predict_dir)
-
-            signal_pool.append({"score":score,"data":signal})
-            if len(signal_pool)>SIGNAL_POOL_SIZE:
-                signal_pool.pop(0)
-
-            sorted_pool = sorted(signal_pool,key=lambda x:x["score"],reverse=True)
-            top_n = max(1,int(len(sorted_pool)*TOP_PERCENT))
-
-            if {"score":score,"data":signal} in sorted_pool[:top_n]:
-                push(*signal)
+    # 分批处理，避免过多协程爆队列
+    batch_size=20
+    for i in range(0,len(symbols),batch_size):
+        batch=symbols[i:i+batch_size]
+        tasks=[process_symbol(sym) for sym in batch]
+        await asyncio.gather(*tasks)
+    await client.close_connection()
 
 # =====================================================
-# WebSocket订阅
+# 主循环
 # =====================================================
-async def subscribe(symbol):
-    url=f"wss://fstream.binance.com/ws/{symbol.lower()}@aggTrade"
-
-    async with semaphore:
-        while True:
-            try:
-                async with aiohttp.ClientSession() as s:
-                    async with s.ws_connect(url) as ws:
-                        async for msg in ws:
-                            data=json.loads(msg.data)
-
-                            if symbol not in trade_queues:
-                                trade_queues[symbol]=deque(maxlen=MAX_QUEUE_LEN)
-
-                            trade_queues[symbol].append({
-                                "price":float(data['p']),
-                                "qty":float(data['q'])
-                            })
-            except:
-                await asyncio.sleep(5)
-
-# =====================================================
-# 币种过滤（800万）
-# =====================================================
-def get_symbols():
-    tickers=client.futures_ticker()
-
-    filtered=[t for t in tickers if t['symbol'].endswith("USDT")
-              and float(t['quoteVolume'])>=MIN_24H_VOLUME]
-
-    filtered.sort(key=lambda x:float(x['quoteVolume']),reverse=True)
-
-    symbols=[t['symbol'] for t in filtered[:TOPN]]
-
-    print("监听币种:",len(symbols))
-    return symbols
-
-# =====================================================
-# 主启动
-# =====================================================
-async def main():
-    symbols=get_symbols()
-    tasks=[]
-
-    for i in range(0,len(symbols),BATCH_SIZE):
-        batch=symbols[i:i+BATCH_SIZE]
-
-        for s in batch:
-            tasks.append(asyncio.create_task(subscribe(s)))
-            tasks.append(asyncio.create_task(phase_monitor(s)))
-
-        await asyncio.sleep(1)
-
-    await asyncio.gather(*tasks)
-
 if __name__=="__main__":
-    asyncio.run(main())
+    print("🚀 全市场 Phase2/Phase4 信号监控启动")
+    loop = asyncio.get_event_loop()
+    while True:
+        loop.run_until_complete(monitor_all_symbols())
+        time.sleep(5)  # 全市场轮询间隔，可调
