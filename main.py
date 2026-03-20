@@ -7,156 +7,153 @@ from datetime import datetime
 from binance import AsyncClient, BinanceSocketManager
 
 # =====================================================
-# 配置参数
+# 严格参数区
 # =====================================================
 API_KEY = ""
 API_SECRET = ""
 SERVER_CHAN_KEY = "sctp14659thuntd89pzhhlsmbwynooxu"
 
-MIN_24H_VOLUME = 8_000_000  # 24h成交额筛选
-PHASE_THRESH_PCT = 1.2      # 涨幅阈值
-VOL_RATIO_THRESHOLD = 2   # 放量倍数
-EMA_PERIOD = 144            # 均线周期
-TREND_WINDOW = 100          # 趋势统计窗口
-TREND_RATIO = 0.7           # 占比阈值（70%时间在上方为看涨）
-
-PHASE_COOLDOWN = 180         # 同币种同Phase冷却(秒)
-KLINE_MAX = 300             # 内存保留K线数量
+MIN_24H_VOLUME = 10_000_000 # 提高门槛，过滤僵尸币
+PHASE_THRESH_PCT = 0.6      # 1分钟涨幅必须 >= 0.6%
+VOL_RATIO_THRESHOLD = 1.2   # 1分钟成交量必须 >= 20min均值的1.5倍
+EMA_PERIOD = 144
+TREND_WINDOW = 100          # 回溯100根K线
+TREND_RATIO = 0.7           # 70%时间在均线上方才算看涨
 
 # =====================================================
-# 全局数据
+# 核心数据容器
 # =====================================================
-kline_data = defaultdict(lambda: deque(maxlen=KLINE_MAX))
+# 必须存储足够的K线来计算 EMA144 + 100根统计窗
+kline_vault = defaultdict(lambda: deque(maxlen=300)) 
 last_push_time = {}
 
 # =====================================================
-# 趋势判定引擎：K线运行占比逻辑
+# 趋势与评分引擎（严格逻辑版）
 # =====================================================
-def get_trend_quality(symbol):
-    data = list(kline_data[symbol])
-    if len(data) < (EMA_PERIOD + TREND_WINDOW):
-        return "初始化中", 0
+def analyze_market_standard(symbol):
+    data = list(kline_vault[symbol])
+    if len(data) < 244: return None # 144+100 根基础要求
     
     df = pd.DataFrame(data)
-    # 计算 EMA144
-    ema = df['c'].ewm(span=EMA_PERIOD, adjust=False).mean()
-    
-    # 取最后 100 根进行占比统计
-    last_100_c = df['c'].tail(TREND_WINDOW)
-    last_100_ema = ema.tail(TREND_WINDOW)
-    
-    # 计算在均线上方的 K 线数量
-    above_count = (last_100_c > last_100_ema).sum()
-    ratio = above_count / TREND_WINDOW
+    df['c'] = df['c'].astype(float)
+    df['v'] = df['v'].astype(float)
+    df['o'] = df['o'].astype(float)
 
-    if ratio >= TREND_RATIO:
-        return "看涨", ratio
-    elif ratio <= (1 - TREND_RATIO):
-        return "看跌", ratio
-    else:
-        return "震荡", ratio
+    # 1. 计算当前这根 K 线的真实表现 (收盘 vs 开盘)
+    last_k = df.iloc[-1]
+    actual_pct = (last_k['c'] - last_k['o']) / last_k['o'] * 100
+    
+    # 2. 计算真实放量比 (当前分钟量 / 过去20分钟均值)
+    vol_ma20 = df['v'].iloc[-21:-1].mean() # 不含当前根，算前20根的均值
+    actual_vol_ratio = last_k['v'] / (vol_ma20 + 1e-9)
+
+    # 3. 严格趋势占比判断 (过去100根K线)
+    ema144_series = df['c'].ewm(span=EMA_PERIOD, adjust=False).mean()
+    # 统计过去100根K线收盘价 > EMA144 的数量
+    window_c = df['c'].tail(TREND_WINDOW)
+    window_ema = ema144_series.tail(TREND_WINDOW)
+    above_count = (window_c > window_ema).sum()
+    occupancy = above_count / TREND_WINDOW
+
+    trend_label = "震荡"
+    if occupancy >= TREND_RATIO: trend_label = "看涨"
+    elif occupancy <= (1 - TREND_RATIO): trend_label = "看跌"
+
+    return {
+        "pct": actual_pct,
+        "vol_ratio": actual_vol_ratio,
+        "trend": trend_label,
+        "ratio": occupancy,
+        "price": last_k['c']
+    }
 
 # =====================================================
-# 核心计算与信号匹配
+# 信号触发逻辑
 # =====================================================
-async def check_signal(symbol):
-    trend, ratio = get_trend_quality(symbol)
-    
-    # 获取最新一根K线数据计算涨幅和放量
-    df = pd.DataFrame(list(kline_data[symbol]))
-    last = df.iloc[-1]
-    vol_ma20 = df['v'].rolling(20).mean().iloc[-1]
-    
-    pct = (last['c'] - last['o']) / last['o'] * 100
-    vol_ratio = last['v'] / (vol_ma20 + 1e-9)
+async def on_kline_closed(symbol):
+    res = analyze_market_standard(symbol)
+    if not res: return
 
-    # 判定 Phase
+    abs_pct = abs(res['pct'])
+    vol_r = res['vol_ratio']
+
+    # 严格阈值拦截：不达标绝对不推
     phase = 0
-    if abs(pct) >= PHASE_THRESH_PCT * 1.5:
+    if abs_pct >= PHASE_THRESH_PCT * 1.5: 
         phase = 4
-    elif abs(pct) >= PHASE_THRESH_PCT and vol_ratio >= VOL_RATIO_THRESHOLD:
+    elif abs_pct >= PHASE_THRESH_PCT and vol_r >= VOL_RATIO_THRESHOLD:
         phase = 2
     
     if phase == 0: return
 
-    # 冷却与重复检查
+    # 冷却检查
     now = time.time()
-    if now - last_push_time.get((symbol, phase), 0) < PHASE_COOLDOWN:
+    if now - last_push_time.get((symbol, phase), 0) < 120: # 提高冷却到2分钟
         return
-
+    
     last_push_time[(symbol, phase)] = now
-    
-    # 构造推送内容
-    msg = (f"币对: {symbol} | Phase {phase}\n"
-           f"趋势状态: {trend} (占比:{ratio:.2%})\n"
-           f"当前涨幅: {pct:.2f}%\n"
-           f"放量比率: {vol_ratio:.2f}x\n"
-           f"实时价格: {last['c']}\n"
-           f"时间: {datetime.now().strftime('%M:%S')}")
-    
-    print(f"核心信号触发: {symbol} P{phase} | {trend}")
-    asyncio.create_task(push_to_server_chan(f"{symbol} P{phase}", msg))
 
-async def push_to_server_chan(title, content):
+    msg = (f"🚨 {symbol} P{phase} 触发\n"
+           f"分钟涨幅: {res['pct']:.2f}% (阈值:{PHASE_THRESH_PCT}%)\n"
+           f"放量倍数: {res['vol_ratio']:.2f}x (阈值:{VOL_RATIO_THRESHOLD}x)\n"
+           f"趋势背景: {res['trend']} ({res['ratio']:.0%})\n"
+           f"收盘价格: {res['price']}")
+    
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] 确认信号: {symbol} P{phase}")
+    asyncio.create_task(send_secure_push(f"{symbol} P{phase}", msg))
+
+async def send_secure_push(title, content):
     if not SERVER_CHAN_KEY: return
-    url = f"https://sctapi.ftqq.com/{SERVER_CHAN_KEY}.send"
     async with aiohttp.ClientSession() as session:
         try:
-            await session.post(url, data={"title": title, "desp": content}, timeout=5)
+            await session.post(f"https://sctapi.ftqq.com/{SERVER_CHAN_KEY}.send", 
+                               data={"title": title, "desp": content}, timeout=5)
         except: pass
 
 # =====================================================
-# 数据预热：防止启动时的指标虚假
+# 核心引擎：只听 K 线完成事件
 # =====================================================
-async def preload_data(client, symbols):
-    print(f"⏳ 正在为 {len(symbols)} 个币种预加载 300 根历史K线...")
-    for s in symbols:
-        try:
-            klines = await client.futures_klines(symbol=s, interval='1m', limit=300)
-            for k in klines:
-                kline_data[s].append({'o':float(k[1]), 'h':float(k[2]), 'l':float(k[3]), 'c':float(k[4]), 'v':float(k[5])})
-        except Exception as e:
-            print(f"预加载 {s} 失败: {e}")
-        await asyncio.sleep(0.05) # 避开频率限制
-    print("✅ 预加载完成，指标已校准。")
-
-# =====================================================
-# WebSocket 接收引擎
-# =====================================================
-async def run_shard(client, symbols):
+async def run_market_radar(client, symbols):
     bm = BinanceSocketManager(client)
-    # 使用 miniTicker 获取每秒最新的价格和成交量聚合
-    async with bm.multiplex_socket([f"{s.lower()}@miniTicker" for s in symbols]) as stream:
+    # 核心修改：只监听 kline_1m
+    async with bm.multiplex_socket([f"{s.lower()}@kline_1m" for s in symbols]) as stream:
         while True:
             try:
                 msg = await stream.recv()
-                res = msg.get('data', {})
-                s = res.get('s')
-                if s:
-                    # 实时模拟 1m K线更新
-                    kline_data[s].append({
-                        'o': float(res['o']), 'h': float(res['h']),
-                        'l': float(res['l']), 'c': float(res['c']), 'v': float(res['v'])
+                k_data = msg['data']['k']
+                symbol = msg['data']['s']
+                
+                # 只有当这根 1m K 线【确认走完】时才记录并计算
+                # 这保证了数据和你在 App 上看到的一模一样
+                if k_data['x']: 
+                    kline_vault[symbol].append({
+                        'o': float(k_data['o']), 'h': float(k_data['h']),
+                        'l': float(k_data['l']), 'c': float(k_data['c']), 'v': float(k_data['v'])
                     })
-                    await check_signal(s)
+                    await on_kline_closed(symbol)
             except Exception as e:
-                print(f"WS分片运行异常: {e}")
                 await asyncio.sleep(5)
 
 async def main():
     client = await AsyncClient.create(API_KEY, API_SECRET)
     try:
-        # 获取市场列表
-        info = await client.futures_ticker()
-        symbols = [t['symbol'] for t in info if t['symbol'].endswith("USDT") 
+        # 获取初选名单
+        tickers = await client.futures_ticker()
+        symbols = [t['symbol'] for t in tickers if t['symbol'].endswith("USDT") 
                    and float(t['quoteVolume']) > MIN_24H_VOLUME]
         
-        await preload_data(client, symbols)
-        
-        # 分片启动（每20个币一个Task）
-        shard_size = 20
-        tasks = [run_shard(client, symbols[i:i+shard_size]) for i in range(0, len(symbols), shard_size)]
-        print(f"🚀 系统已上线，监控中...")
+        # 必须预加载，否则趋势占比前100分钟无法计算
+        print(f"开始预加载 {len(symbols)} 个币种的历史K线...")
+        for s in symbols:
+            kls = await client.futures_klines(symbol=s, interval='1m', limit=300)
+            for k in kls:
+                kline_vault[s].append({'o':float(k[1]),'h':float(k[2]),'l':float(k[3]),'c':float(k[4]),'v':float(k[5])})
+            await asyncio.sleep(0.02) # 防止频率过快
+
+        # 分片运行
+        shard_size = 25
+        tasks = [run_market_radar(client, symbols[i:i+shard_size]) for i in range(0, len(symbols), shard_size)]
+        print("🚀 核心雷达已锁定全市场，严格模式开启。")
         await asyncio.gather(*tasks)
     finally:
         await client.close_connection()
